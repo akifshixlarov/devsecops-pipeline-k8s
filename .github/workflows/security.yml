@@ -1,0 +1,616 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# SECURITY GATES — Phase 2 (SAST · SCA/SBOM · Secret Detection · IaC · CI Security)
+#
+# HƏR JOB EYNİ NÜMUNƏNİ İZLƏYİR:
+#   scan (--exit-code 0) → artifact → DefectDojo upload → severity gate → exit
+#
+# Scanner ADDIMI HEÇ VAXT job-u fail etmir (`--exit-code 0`). Fail qərarını
+# YALNIZ `ci/severity_gate.py` verir və o, DefectDojo upload-dan SONRA işləyir.
+# Səbəb: pipeline fail olsa belə finding-lər mərkəzi store-a yazılmalıdır
+# (capstone tələbi: "Pipeline fail olsa belə DefectDojo report-u qəbul etməlidir").
+# ═════════════════════════════════════════════════════════════════════════════
+name: Security Gates
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Həftəlik yenidən scan: kod dəyişməsə də yeni CVE-lər elan olunur.
+    # Bu, "dünən green idi, bu gün də green-dir" yanlış təhlükəsizlik hissini aradan qaldırır.
+    - cron: '0 3 * * 1'
+
+# ── LEAST PRIVILEGE ──────────────────────────────────────────────────────────
+# Workflow səviyyəsində YALNIZ `contents: read`.
+# Əlavə icazə lazım olan job onu ÖZÜ elan edir (aşağıda `security-events: write`).
+# `permissions: write-all` və ya default geniş token QƏTİYYƏN istifadə edilmir.
+permissions:
+  contents: read
+
+# Eyni branch üçün köhnə run-ları ləğv et — resurs israfının və
+# "köhnə green check yeni commit-i təsdiqləyir" race condition-un qarşısını alır.
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.12'
+  # DefectDojo upload-un məcburiliyi.
+  # Protected branch-də (push to main) evidence zənciri qırılarsa → FAIL.
+  # PR-də → yalnız xəbərdarlıq (fork PR-lar secret ala bilmir, bax aşağı).
+  DD_UPLOAD_REQUIRED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 1 — SAST (Semgrep)
+  #
+  # Nə edir: tətbiq mənbə kodunu pattern/taint analizi ilə yoxlayır.
+  # Hansı threat: T1 (hardcoded secret kodda), tətbiq səviyyəli injection,
+  #               təhlükəsiz olmayan konfiqurasiya (threat-model § 3.1, 3.8).
+  # Attack pattern: hardcoded credential, command/SQL injection, unsafe eval,
+  #               zəif kriptoqrafiya, təhlükəsiz olmayan deserializasiya.
+  # Failure davranışı: HIGH/CRITICAL finding → gate exit 1 → merge bloklanır.
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-1-sast:
+    name: 'Gate 1 — SAST (Semgrep)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write   # SARIF-i GitHub Code Scanning-ə yükləmək üçün
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Git credential-ı runner-in diskində SAXLAMA.
+          # Əks halda sonrakı addımlardan (və ya kompromis olmuş dependency-dən)
+          # `git push` etmək mümkün olur. zizmor bunu `artipacked` kimi flag edir.
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install gate dependencies
+        run: pip install --quiet -r ci/requirements.txt
+
+      - name: Install Semgrep (pinned)
+        run: bash ci/install-scanners.sh semgrep
+
+      - name: Run Semgrep
+        # --error YOXDUR və exit code udulur: scan addımı gate DEYİL.
+        # Gate qərarı DefectDojo upload-dan sonra verilir.
+        run: |
+          mkdir -p reports
+          set +e
+          semgrep scan \
+            --config=p/security-audit \
+            --config=p/javascript \
+            --config=p/owasp-top-ten \
+            --config=security/semgrep/rules \
+            --metrics=off \
+            --json --output=reports/semgrep.json \
+            --sarif --sarif-output=reports/semgrep.sarif \
+            app/
+          echo "semgrep raw exit: $?"
+          set -e
+          test -f reports/semgrep.json || echo '{"results":[]}' > reports/semgrep.json
+
+      - name: Upload SAST artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-1-sast-reports
+          path: reports/
+          retention-days: 30
+
+      - name: Upload SARIF to GitHub Code Scanning
+        # Fork PR-larda `security-events: write` mövcud deyil → atlanır.
+        if: always() && github.event.pull_request.head.repo.fork != true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/semgrep.sarif
+          category: semgrep
+
+      # ── ADDIM SIRASI KRİTİKDİR: upload ƏVVƏL, gate SONRA ──────────────────
+      - name: 'DefectDojo — reimport (gate-dən ƏVVƏL)'
+        if: always()
+        env:
+          DD_URL: ${{ secrets.DD_URL }}
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_ENGAGEMENT_ID: ${{ secrets.DD_ENGAGEMENT_ID }}
+        run: |
+          python3 ci/defectdojo_upload.py \
+            --scanner semgrep \
+            --report reports/semgrep.json \
+            --required "${DD_UPLOAD_REQUIRED}"
+
+      - name: 'Severity gate — SAST'
+        if: always()
+        run: |
+          python3 ci/severity_gate.py \
+            --report reports/semgrep.json \
+            --format semgrep \
+            --scanner semgrep
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 2 — SCA + SBOM (Trivy)
+  #
+  # Nə edir: dependency ağacındakı məlum CVE-ləri tapır və CycloneDX SBOM yaradır.
+  # Hansı threat: T2 (vulnerable dependency production-a çatır) — Critical risk.
+  # Attack pattern: məlum CVE-si olan kitabxana (prototype pollution, RCE,
+  #               ReDoS), typosquatting nəticəsində gələn zərərli paket.
+  # Failure davranışı: düzəlişi MÖVCUD olan HIGH/CRITICAL CVE → exit 1.
+  #               `--ignore-unfixed` səbəbindən düzəlişi olmayan CVE bloklamır
+  #               (əks halda gate əbədi qırmızı qalar və komanda onu söndürər —
+  #               bu, real enterprise-da ən çox rast gəlinən gate ölümüdür).
+  # SBOM: ayrıca artifact; Phase 4-də Cosign attestation-a daxil olacaq.
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-2-sca-sbom:
+    name: 'Gate 2 — SCA + SBOM (Trivy)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install gate dependencies
+        run: pip install --quiet -r ci/requirements.txt
+
+      - name: Install Trivy (pinned + checksum verified)
+        run: bash ci/install-scanners.sh trivy
+
+      # Trivy vulnerability DB-ni cache-lə: hər run-da ~50MB endirmək
+      # GitHub Container Registry rate limit-inə düşməyə səbəb olur.
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+
+      - name: Run Trivy SCA (dependency vulnerabilities)
+        run: |
+          mkdir -p reports
+          set +e
+          trivy fs \
+            --scanners vuln \
+            --ignore-unfixed \
+            --format json \
+            --output reports/trivy-sca.json \
+            --exit-code 0 \
+            app/
+          echo "trivy raw exit: $?"
+          set -e
+          test -f reports/trivy-sca.json || echo '{"Results":[]}' > reports/trivy-sca.json
+
+      - name: Run Trivy SCA (SARIF for Code Scanning)
+        run: |
+          trivy fs --scanners vuln --ignore-unfixed \
+            --format sarif --output reports/trivy-sca.sarif --exit-code 0 app/ || true
+
+      - name: Generate SBOM (CycloneDX)
+        # CycloneDX seçilib (SPDX deyil): Cosign attestation, Dependency-Track və
+        # DefectDojo bu formatı native dəstəkləyir; Phase 4-də signed attestation
+        # kimi image-ə bağlanacaq.
+        run: |
+          trivy fs --format cyclonedx --output reports/sbom.cdx.json app/
+          echo "SBOM komponent sayı: $(python3 -c "import json;print(len(json.load(open('reports/sbom.cdx.json')).get('components',[])))")"
+
+      - name: Upload SCA + SBOM artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-2-sca-sbom-reports
+          path: reports/
+          retention-days: 90    # SBOM audit üçün daha uzun saxlanılır
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && github.event.pull_request.head.repo.fork != true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-sca.sarif
+          category: trivy-sca
+
+      - name: 'DefectDojo — reimport (gate-dən ƏVVƏL)'
+        if: always()
+        env:
+          DD_URL: ${{ secrets.DD_URL }}
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_ENGAGEMENT_ID: ${{ secrets.DD_ENGAGEMENT_ID }}
+        run: |
+          python3 ci/defectdojo_upload.py \
+            --scanner trivy-sca \
+            --report reports/trivy-sca.json \
+            --required "${DD_UPLOAD_REQUIRED}"
+
+      - name: 'Severity gate — SCA'
+        if: always()
+        run: |
+          python3 ci/severity_gate.py \
+            --report reports/trivy-sca.json \
+            --format trivy \
+            --scanner trivy-sca
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 3 — SECRET DETECTION (Gitleaks)
+  #
+  # Nə edir: working tree VƏ bütün git history-ni credential pattern-ləri üçün skan edir.
+  # Hansı threat: T1 (Critical, score 9) — repo-ya commit edilmiş secret.
+  # Attack pattern: .env commit, hardcoded API key, private key, DB connection string.
+  # Failure davranışı: HƏR HANSI finding → exit 1. Tolerantlıq YOXDUR.
+  #   Səbəb: git history immutable-dır — secret-i növbəti commit-də silmək onu
+  #   ləğv etmir; credential artıq kompromis sayılmalı və ROTASİYA edilməlidir.
+  #
+  # ⚠ ARTIFACT TƏHLÜKƏSİZLİYİ: Gitleaks JSON report-u tapılan secret-in ÖZ
+  #   DƏYƏRİNİ saxlayır. Xam report-u artifact kimi yükləmək secret detection
+  #   alətini secret leak kanalına çevirər. Ona görə:
+  #     - XAM report → yalnız DefectDojo-ya (autentifikasiyalı store)
+  #     - REDAKTƏ EDİLMİŞ report → artifact-a
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-3-secret-detection:
+    name: 'Gate 3 — Secret Detection (Gitleaks)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 → bütün commit tarixçəsi.
+          # Bunsuz Gitleaks yalnız son commit-i görür və "6 ay əvvəl commit
+          # edilmiş, sonra silinmiş" secret-i TAPMIR.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install gate dependencies
+        run: pip install --quiet -r ci/requirements.txt
+
+      - name: Install Gitleaks (pinned + checksum verified)
+        run: bash ci/install-scanners.sh gitleaks
+
+      - name: Run Gitleaks (full git history)
+        run: |
+          mkdir -p reports
+          set +e
+          gitleaks git . \
+            --config security/gitleaks/gitleaks.toml \
+            --report-format json \
+            --report-path reports/gitleaks-raw.json \
+            --exit-code 0 \
+            --redact=0 \
+            --verbose
+          echo "gitleaks raw exit: $?"
+          set -e
+          test -f reports/gitleaks-raw.json || echo '[]' > reports/gitleaks-raw.json
+          echo "Finding sayı: $(python3 -c "import json;print(len(json.load(open('reports/gitleaks-raw.json'))))")"
+
+      - name: Redact secrets before artifact upload
+        run: |
+          python3 ci/redact_gitleaks.py \
+            --input reports/gitleaks-raw.json \
+            --output reports/gitleaks-redacted.json
+
+      - name: 'DefectDojo — reimport (XAM report, gate-dən ƏVVƏL)'
+        if: always()
+        env:
+          DD_URL: ${{ secrets.DD_URL }}
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_ENGAGEMENT_ID: ${{ secrets.DD_ENGAGEMENT_ID }}
+        run: |
+          python3 ci/defectdojo_upload.py \
+            --scanner gitleaks \
+            --report reports/gitleaks-raw.json \
+            --required "${DD_UPLOAD_REQUIRED}"
+
+      - name: Delete raw report from runner
+        # DefectDojo-ya göndərildikdən sonra xam report diskdə qalmamalıdır —
+        # sonrakı heç bir addım (və ya artifact upload) ona toxuna bilməsin.
+        if: always()
+        run: rm -f reports/gitleaks-raw.json
+
+      - name: Upload REDACTED artifacts only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-3-secret-reports
+          path: reports/gitleaks-redacted.json
+          retention-days: 30
+
+      - name: 'Severity gate — Secret Detection'
+        if: always()
+        run: |
+          python3 ci/severity_gate.py \
+            --report reports/gitleaks-redacted.json \
+            --format gitleaks \
+            --scanner gitleaks
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 4 — IaC / Configuration (Trivy config)
+  #
+  # Nə edir: Dockerfile, Kubernetes manifest və (varsa) Terraform fayllarını
+  #          təhlükəsizlik misconfiguration-ları üçün yoxlayır.
+  # Hansı threat: T3 (root/privileged container), T6 (IaC misconfiguration merge).
+  # Attack pattern: privileged:true, hostNetwork, root user, latest tag,
+  #                 readOnlyRootFilesystem:false, capability drop olmaması.
+  # Failure davranışı: HIGH/CRITICAL misconfiguration → exit 1.
+  # Qeyd: Phase 2-də scan hədəfi `app/Dockerfile`-dır. Phase 5-də `k8s/`
+  #       qovluğu əlavə olunanda EYNİ job avtomatik onu da əhatə edəcək —
+  #       workflow dəyişikliyi tələb olunmur.
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-4-iac:
+    name: 'Gate 4 — IaC (Trivy config)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install gate dependencies
+        run: pip install --quiet -r ci/requirements.txt
+
+      - name: Install Trivy (pinned + checksum verified)
+        run: bash ci/install-scanners.sh trivy
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+
+      - name: Run Trivy config scan
+        run: |
+          mkdir -p reports
+          set +e
+          trivy config \
+            --format json \
+            --output reports/trivy-config.json \
+            --exit-code 0 \
+            .
+          echo "trivy config raw exit: $?"
+          trivy config --format sarif --output reports/trivy-config.sarif --exit-code 0 . || true
+          set -e
+          test -f reports/trivy-config.json || echo '{"Results":[]}' > reports/trivy-config.json
+
+      - name: Upload IaC artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-4-iac-reports
+          path: reports/
+          retention-days: 30
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && github.event.pull_request.head.repo.fork != true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-config.sarif
+          category: trivy-config
+
+      - name: 'DefectDojo — reimport (gate-dən ƏVVƏL)'
+        if: always()
+        env:
+          DD_URL: ${{ secrets.DD_URL }}
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_ENGAGEMENT_ID: ${{ secrets.DD_ENGAGEMENT_ID }}
+        run: |
+          python3 ci/defectdojo_upload.py \
+            --scanner trivy-config \
+            --report reports/trivy-config.json \
+            --required "${DD_UPLOAD_REQUIRED}"
+
+      - name: 'Severity gate — IaC'
+        if: always()
+        run: |
+          python3 ci/severity_gate.py \
+            --report reports/trivy-config.json \
+            --format trivy \
+            --scanner trivy-config
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 4B — CI/CD SUPPLY CHAIN SECURITY (zizmor)
+  #
+  # Bu gate GitLab versiyasında YOX İDİ — GitHub-a keçidin nəticəsi olaraq əlavə edilib.
+  #
+  # Niyə lazımdır: GitHub Actions-ın öz hücum səthi var və o, GitLab CI-dan
+  #   fərqlidir. 19 mart 2026-da `aquasecurity/trivy-action` məhz
+  #   `pull_request_target` misconfiguration-ı vasitəsilə kompromis edildi və
+  #   organization secret-ləri oğurlandı. zizmor tam olaraq bu sinif problemləri
+  #   deploy-dan ƏVVƏL tapır.
+  #
+  # Nə tapır: template injection (${{ }} içində untrusted input), həddindən
+  #   artıq geniş `permissions`, `pull_request_target` sui-istifadəsi,
+  #   pinlənməmiş action-lar, impostor commit, credential persistence.
+  # Hansı threat: T7 (CI log/secret sızması), T12 (kompromis CI runner/action).
+  # Failure davranışı: MEDIUM və yuxarı → exit 1 (policy.yaml-da zizmor üçün
+  #   Medium qəsdən block-dur, çünki bu kateqoriyada Medium = secret leak riski).
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-4b-ci-security:
+    name: 'Gate 4B — CI/CD Security (zizmor)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install gate dependencies
+        run: pip install --quiet -r ci/requirements.txt
+
+      - name: Install zizmor (pinned)
+        run: bash ci/install-scanners.sh zizmor
+
+      - name: Run zizmor
+        env:
+          # Online audit-lər (impostor-commit aşkarlanması) üçün lazımdır.
+          # Bu, read-only default `github.token`-dur — əlavə icazə vermir.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p reports
+          set +e
+          zizmor --format sarif .github/ > reports/zizmor.sarif
+          echo "zizmor raw exit: $?"
+          set -e
+          test -s reports/zizmor.sarif || echo '{"version":"2.1.0","runs":[]}' > reports/zizmor.sarif
+
+      - name: Upload CI security artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-4b-ci-security-reports
+          path: reports/
+          retention-days: 30
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && github.event.pull_request.head.repo.fork != true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/zizmor.sarif
+          category: zizmor
+
+      - name: 'DefectDojo — reimport (gate-dən ƏVVƏL)'
+        if: always()
+        env:
+          DD_URL: ${{ secrets.DD_URL }}
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_ENGAGEMENT_ID: ${{ secrets.DD_ENGAGEMENT_ID }}
+        run: |
+          python3 ci/defectdojo_upload.py \
+            --scanner zizmor \
+            --report reports/zizmor.sarif \
+            --required "${DD_UPLOAD_REQUIRED}"
+
+      - name: 'Severity gate — CI/CD Security'
+        if: always()
+        run: |
+          python3 ci/severity_gate.py \
+            --report reports/zizmor.sarif \
+            --format sarif \
+            --scanner zizmor
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # AGGREGATE GATE — bypass qarşısını alan tək required status check
+  #
+  # NİYƏ BU JOB VAR:
+  #   GitHub-da branch protection konkret job ADLARINI required check kimi
+  #   siyahıya alır. Əgər 5 job-un hər birini ayrıca required etsək:
+  #     - kimsə job-un adını dəyişsə, həmin check "gözlənilir" statusunda
+  #       ilişib qalır və ya siyahıdan düşür → BYPASS;
+  #     - yeni gate əlavə edəndə repo settings-i əl ilə yeniləmək lazım gəlir
+  #       (unutmaq = yeni gate merge-i heç vaxt bloklamır).
+  #   Ona görə branch protection-da YALNIZ BİR required check var: `security-gate`.
+  #   Yeni gate əlavə etmək üçün onu `needs:` siyahısına yazmaq kifayətdir —
+  #   repo settings-ə toxunmadan avtomatik məcburi olur.
+  #
+  # `if: always()` + nəticələrin əl ilə yoxlanması vacibdir: `always()` olmasa,
+  # hər hansı `needs` job-u fail olanda bu job SKIPPED olar, GitHub isə skipped
+  # required check-i bəzi konfiqurasiyalarda "neytral" sayır → BYPASS.
+  # Biz açıq şəkildə result string-lərini yoxlayıb özümüz fail edirik.
+  # ═══════════════════════════════════════════════════════════════════════════
+  security-gate:
+    name: 'Security Gate (required)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - gate-1-sast
+      - gate-2-sca-sbom
+      - gate-3-secret-detection
+      - gate-4-iac
+      - gate-4b-ci-security
+    permissions:
+      contents: read
+    steps:
+      - name: Evaluate all gates
+        env:
+          R_SAST: ${{ needs.gate-1-sast.result }}
+          R_SCA: ${{ needs.gate-2-sca-sbom.result }}
+          R_SECRET: ${{ needs.gate-3-secret-detection.result }}
+          R_IAC: ${{ needs.gate-4-iac.result }}
+          R_CI: ${{ needs.gate-4b-ci-security.result }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Security Gate — yekun nəticə"
+            echo ""
+            echo "| Gate | Tool | Nəticə |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=0
+          check() {
+            local name="$1" tool="$2" result="$3"
+            local icon="❌"
+            case "$result" in
+              success)   icon="✅" ;;
+              skipped)   icon="⏭️" ;;
+              cancelled) icon="🚫" ;;
+            esac
+            echo "| $name | $tool | $icon \`$result\` |" >> "$GITHUB_STEP_SUMMARY"
+            # DİQQƏT: yalnız `success` qəbul edilir.
+            # `skipped` və `cancelled` PASS SAYILMIR — əks halda job-u atlatmaqla
+            # gate bypass etmək mümkün olardı.
+            if [ "$result" != "success" ]; then
+              failed=$((failed + 1))
+            fi
+          }
+
+          check "Gate 1 — SAST"           "Semgrep"       "$R_SAST"
+          check "Gate 2 — SCA + SBOM"     "Trivy"         "$R_SCA"
+          check "Gate 3 — Secret"         "Gitleaks"      "$R_SECRET"
+          check "Gate 4 — IaC"            "Trivy config"  "$R_IAC"
+          check "Gate 4B — CI/CD"         "zizmor"        "$R_CI"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failed" -ne 0 ]; then
+            echo "### ❌ $failed gate uğursuz — merge/deploy BLOKLANDI" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Detallar üçün hər gate-in öz job summary-sinə və DefectDojo engagement-ə baxın." >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$failed security gate uğursuz oldu — pipeline dayandırıldı"
+            exit 1
+          fi
+
+          echo "### ✅ Bütün security gate-lər PASS" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Phase 3 (Build + Image Security) icra oluna bilər." >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,77 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SECURITY GATE POLICY
+#
+# Bu fayl bütün pipeline üçün YEGANƏ severity həqiqət mənbəyidir (single source
+# of truth). Workflow YAML-larında hardcoded threshold YOXDUR — belə ki, policy
+# dəyişikliyi audit edilə bilən tək bir commit-də görünür.
+#
+# Hər severity üçün action:
+#   block → gate FAIL edir (exit 1), pipeline dayanır
+#   warn  → gate log-a yazır, PASS davam edir
+#   ignore→ tamamilə nəzərə alınmır (istifadəsi tövsiyə olunmur)
+#
+# `max_allowed`: həmin severity üçün icazə verilən maksimum finding sayı.
+# Yalnız action=warn olduqda məna kəsb edir (məs. "5 medium-a qədər OK, 6-dan
+# çoxu isə block"). action=block olduqda hər hansı 1 finding kifayətdir.
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: 1
+
+# Bütün scanner-lər üçün default siyasət.
+# Capstone specification-a uyğun: Critical → BLOCK, High → BLOCK,
+# Medium → configurable, Low → report only.
+default:
+  critical: { action: block }
+  high:     { action: block }
+  medium:   { action: warn, max_allowed: 25 }
+  low:      { action: warn }
+  unknown:  { action: warn }
+
+# Scanner-spesifik override-lar. Açar `severity_gate.py --scanner` dəyəri ilə eynidir.
+scanners:
+
+  # SAST — tətbiq kodundakı zəifliklər.
+  semgrep:
+    critical: { action: block }
+    high:     { action: block }
+    medium:   { action: warn, max_allowed: 10 }
+    low:      { action: warn }
+
+  # SCA — dependency CVE-ləri.
+  # Qeyd: fixed version olmayan CVE-lər üçün `--ignore-unfixed` Trivy tərəfində
+  # tətbiq olunur, ona görə buraya çatan hər High/Critical həqiqətən düzəldilə biləndir.
+  trivy-sca:
+    critical: { action: block }
+    high:     { action: block }
+    medium:   { action: warn, max_allowed: 20 }
+    low:      { action: warn }
+
+  # SECRET DETECTION — ən sərt siyasət.
+  # Gitleaks severity anlayışı vermir; `severity_gate.py` hər secret finding-i
+  # CRITICAL kimi normalize edir. Səbəb: repo-ya düşmüş istənilən credential
+  # artıq kompromis sayılmalıdır (git history immutable-dir, sadəcə silmək kifayət etmir).
+  # HEÇ BİR tolerantlıq yoxdur — 1 finding = FAIL.
+  gitleaks:
+    critical: { action: block }
+    high:     { action: block }
+    medium:   { action: block }
+    low:      { action: block }
+    unknown:  { action: block }
+
+  # IaC — Kubernetes/Dockerfile misconfiguration.
+  trivy-config:
+    critical: { action: block }
+    high:     { action: block }
+    medium:   { action: warn, max_allowed: 15 }
+    low:      { action: warn }
+
+  # CI/CD-in ÖZÜNÜN təhlükəsizliyi (GitHub Actions workflow analizi).
+  # Burada Medium də block-dur: template injection və unpinned action kimi
+  # tapıntılar zizmor-da tez-tez Medium kimi qiymətləndirilir, lakin bizim
+  # threat model-də bunlar T7 (CI secret leakage) və supply-chain riskidir.
+  zizmor:
+    critical: { action: block }
+    high:     { action: block }
+    medium:   { action: block }
+    low:      { action: warn }
+    unknown:  { action: warn }

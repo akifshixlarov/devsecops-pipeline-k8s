@@ -1,0 +1,49 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Dependabot — pinləmənin "digər tərəfi".
+#
+# Commit SHA ilə pinləmək təhlükəsizdir, LAKİN pin köhnəldikcə təhlükəsizlik
+# yamalarını da bloklayır. Dependabot bu ziddiyyəti həll edir:
+#   - pin immutable qalır (attacker tag-ı dəyişə bilməz);
+#   - yeniləmə isə review tələb edən PR kimi gəlir (insan təsdiqi ilə).
+#
+# Hər Dependabot PR-ı bütün security gate-lərdən keçməlidir — yəni
+# dependency yeniləməsi də eyni bar-a tabedir.
+# ─────────────────────────────────────────────────────────────────────────────
+version: 2
+
+updates:
+  # GitHub Actions — SHA pin-lərini yeniləyir (şərhdəki tag-ı izləyərək).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: [dependencies, security, ci]
+    commit-message:
+      prefix: 'ci(deps)'
+
+  # Node.js tətbiq asılılıqları (Phase 1 app/).
+  - package-ecosystem: npm
+    directory: /app
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    labels: [dependencies, security]
+    commit-message:
+      prefix: 'fix(deps)'
+    groups:
+      # Dev asılılıqları bir PR-da qruplaşdırılır — noise azalır,
+      # production asılılıqları isə ayrıca gəlir (daha diqqətli review üçün).
+      dev-dependencies:
+        dependency-type: development
+
+  # Gate skriptlərinin Python asılılıqları.
+  - package-ecosystem: pip
+    directory: /ci
+    schedule:
+      interval: monthly
+    labels: [dependencies, security, ci]
+    commit-message:
+      prefix: 'ci(deps)'

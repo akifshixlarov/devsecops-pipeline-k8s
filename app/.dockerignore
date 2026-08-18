@@ -1,0 +1,27 @@
+# Asılılıqlar — builder mərhələsində təzədən quraşdırılır
+node_modules
+npm-debug.log*
+
+# Versiya nəzarəti
+.git
+.gitignore
+
+# Secret-lər — bunlar image layer-inə HEÇ VAXT düşməməlidir
+.env
+.env.*
+!.env.example
+
+# Testlər/sənədləşmə — runtime image-ə lazım deyil
+test
+**/*.test.js
+coverage
+docs
+*.md
+
+# Docker-in özü
+Dockerfile
+.dockerignore
+
+# Editor/OS artefaktları
+.vscode
+.DS_Store

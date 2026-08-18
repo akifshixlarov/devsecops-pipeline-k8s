@@ -1,0 +1,12 @@
+# Gitleaks fingerprint-ləri (formatı: <commit>:<file>:<rule-id>:<line>).
+#
+# Buraya YALNIZ təsdiqlənmiş false positive-lər yazılır və HƏR SƏTİR
+# şərhlə əsaslandırılmalıdır (kim, nə vaxt, niyə).
+#
+# ⚠ BURAYA REAL SECRET-İ SUSDURMAQ ÜÇÜN SƏTİR ƏLAVƏ ETMƏK QADAĞANDIR.
+# Real secret tapılıbsa doğru addımlar:
+#   1. Credential-ı DƏRHAL rotasiya et (git-dən silmək kifayət DEYİL).
+#   2. Kodu env variable / K8s Secret istifadə edəcək şəkildə düzəlt.
+#   3. Lazım gələrsə git history-ni təmizlə (git-filter-repo).
+#
+# Hazırda boşdur — heç bir istisna yoxdur.
