@@ -1,0 +1,149 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# SERVICEACCOUNT + RBAC
+#
+# Burada İKİ FƏRQLİ identity var və onları qarışdırmamaq vacibdir:
+#
+#   1. TƏTBİQİN identity-si (app-sa)
+#      → Kubernetes API-yə heç bir ehtiyacı YOXDUR.
+#      → Ona görə HEÇ BİR Role/RoleBinding verilmir və token mount edilmir.
+#
+#   2. CI DEPLOY identity-si (GitHub Actions)
+#      → Azure RBAC ilə idarə olunur (Entra ID), K8s ServiceAccount deyil.
+#      → Aşağıdakı Role namespace daxilində minimal icazə verir.
+#
+# Threat model: T4 — over-privileged ServiceAccount (High, score 6).
+# ═════════════════════════════════════════════════════════════════════════════
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app-sa
+  namespace: capstone
+  labels:
+    app.kubernetes.io/name: secure-cicd-capstone
+
+# ⚠ BU SƏTİR ƏN VACİB HARDENING NÖQTƏLƏRİNDƏN BİRİDİR.
+#
+# Default olaraq Kubernetes hər pod-a ServiceAccount token-ini
+# /var/run/secrets/kubernetes.io/serviceaccount/token yolunda MOUNT EDİR —
+# tətbiqin ona ehtiyacı olub-olmamasından asılı olmayaraq.
+#
+# Nəticə: tətbiqdə RCE və ya SSRF olarsa, hücumçu dərhal həmin token-i
+# oxuyub Kubernetes API-yə müraciət edə bilir. Bu, "tətbiq kompromisi"ni
+# "cluster kəşfiyyatı"na çevirən ən qısa yoldur.
+#
+# Bizim tətbiq stateless HTTP servisidir və K8s API ilə HEÇ BİR işi yoxdur,
+# ona görə token ümumiyyətlə mount edilmir. Mövcud olmayan token oğurlana bilməz.
+automountServiceAccountToken: false
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# CI deploy identity üçün Role.
+#
+# Diqqət: bu Role `ClusterRole` DEYİL — yalnız `capstone` namespace-ində işləyir.
+# Yəni CI kompromis olsa belə, digər namespace-lərə (kube-system daxil olmaqla)
+# toxuna bilməz.
+#
+# `secrets` resursu QƏSDƏN YOXDUR: deploy prosesi Secret oxumağa ehtiyac
+# duymur. Secret oxumaq icazəsi verilsəydi, CI kompromisi bütün namespace
+# secret-lərinin sızması demək olardı (threat model § 3.7 STRIDE-I).
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ci-deployer
+  namespace: capstone
+# ⚠ BU ROLE QESDEN COX DARDIR — ve bu, real tapinti neticesidir.
+#
+# ILK VERSIYADA bu Role-a `networkpolicies` ve `serviceaccounts` uzerinde
+# yazma icazesi verilmişdi. Oz Gate 4-umuz (Trivy config) onu tutdu:
+#
+#     HIGH  KSV-0056  rbac.yaml  Manage Kubernetes networking
+#
+# Yeni CI identity-si tetbiq deploy etmekle yanaşi ŞEBEKE SIYASETINI de
+# deyişdire bilirdi. Bu, kritik bir eskalasiya yoludur: CI kompromis olsa,
+# hucumcu evvelce default-deny NetworkPolicy-ni silib, sonra reverse shell
+# ile serbest egress ede bilerdi. Yeni butun şebeke muhafizesi CI token-i
+# ile bypass olunardi.
+#
+# HELL — MESULIYYET AYRILIGI (separation of duties):
+#   k8s/bootstrap/  → namespace, RBAC, NetworkPolicy, ServiceAccount
+#                     Bir defelik, ADMIN terefinden tetbiq olunur.
+#                     Deyişiklik ayrica review teleb edir.
+#   k8s/app/        → Deployment, Service, PDB
+#                     Her deploy-da CI terefinden tetbiq olunur.
+#
+# Netice: CI tetbiqin YENI VERSIYASINI deploy ede bilir, lakin onu
+# qoruyan tehlukesizlik hasarina TOXUNA BILMIR.
+#
+# Threat model: T4 — over-privileged deploy identity (High, score 6).
+rules:
+  # Deployment idareetmesi — esas deploy emeliyyati.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    # `delete` YOXDUR: pipeline deployment silmemelidir.
+    # Silme insan qerаridir ve ayrica icaze teleb etmelidir.
+
+  # Rollout statusunu izlemek ucun (kubectl rollout status).
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+    # pods/log: deploy ugursuz olduqda CI log-larinda sebebi gostermek ucun.
+    # `pods/exec` YOXDUR — praktiki olaraq "istenilen kodu icra et" demekdir.
+
+  # Service — YALNIZ OXUMA.
+  # Bu da real tapinti neticesidir. Ilk versiyada CI-ye Service uzerinde
+  # yazma icazesi verilmişdi ve Trivy config onu tutdu:
+  #
+  #     HIGH  KSV-0056  "Manage Kubernetes networking"
+  #     "The ability to control which pods get service traffic directed to
+  #      them allows for interception attacks."
+  #
+  # Yeni CI Service-in `selector` sahesini deyişdirib trafiki BAŞQA pod-a
+  # (mes. hucumcunun pod-una) yonlendire bilerdi — istifadeci ucun URL eyni
+  # qalir, trafik ise oğurlanir. Bu, klassik interception hucumudur.
+  #
+  # Service infrastrukturdur ve her release-de deyişmir; Deployment ise
+  # her release-de deyişir. Ona gore Service bootstrap-a kocuruldu.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+
+  # QESDEN YOXDUR (her biri ucun sebeb):
+  #   secrets          → deploy Secret oxumaga ehtiyac duymur; icaze verilseydi
+  #                      CI kompromisi butun namespace secret-lerinin sizmasi olardi
+  #   networkpolicies  → şebeke muhafizesi CI terefinden deyişdirilmemelidir
+  #   serviceaccounts  → identity yaratmaq eskalasiya yoludur
+  #   roles/rolebindings → CI ozune icaze artira bilmemelidir
+  #   configmaps       → hazirda istifade edilmir; lazim olduqda elave edilecek
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ci-deployer
+  namespace: capstone
+subjects:
+  # ⚠ PLACEHOLDER — ci/k8s-deploy.sh tərəfindən əvəz olunur.
+  #
+  # Dəyər Entra ID-dəki service principal-ın OBJECT ID-sidir (application/client
+  # ID DEYİL — bu, ən çox rast gəlinən səhvdir və "forbidden" xətası verir).
+  #
+  # Alınması:
+  #   az ad sp show --id "$AZURE_CLIENT_ID" --query id -o tsv
+  - kind: User
+    name: "__CI_PRINCIPAL_OBJECT_ID__"
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: Role
+  name: ci-deployer
+  apiGroup: rbac.authorization.k8s.io

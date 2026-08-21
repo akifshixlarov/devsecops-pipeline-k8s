@@ -1,0 +1,858 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 3 — BUILD + IMAGE SECURITY (Azure Container Registry)
+#
+# AXIN:
+#   security-gate (Phase 2) PASS
+#        ↓
+#   Gate 5  — Build (Buildx) → push to <repo>-quarantine:<sha>
+#        ↓
+#   Gate 6A — Hadolint      (Dockerfile lint)
+#   Gate 6B — Trivy image   (CVE scan)          ← paralel
+#   Gate 6C — Trivy secret  (layer secret scan)
+#        ↓
+#   Promote — quarantine → <repo>:<sha>, digest doğrulanır, manifest kilidlənir
+#        ↓
+#   image-security-gate (required status check)
+#
+# KRİTİK DİZAYN: image ƏVVƏLCƏ quarantine repository-yə push edilir.
+# Release repository-yə (deploy mənbəyinə) YALNIZ bütün gate-lər PASS
+# olduqdan sonra promote olunur. Beləliklə zəif image heç vaxt deploy
+# edilə bilən yerdə olmur.
+# ═════════════════════════════════════════════════════════════════════════════
+name: Build & Image Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.12'
+  IMAGE_REPO: capstone/app
+  DD_UPLOAD_REQUIRED: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ÖN ŞƏRT — Phase 2 security gate-ləri
+  #
+  # Build YALNIZ SAST/SCA/Secret/IaC/CI gate-ləri keçdikdən sonra baş verməlidir.
+  # GitHub Actions-da workflow-lar arası `needs:` yoxdur, ona görə Phase 2
+  # gate-lərini burada YENİDƏN çağırmaq əvəzinə, `security.yml`-ın nəticəsini
+  # commit SHA üzrə API-dən yoxlayırıq. Bu, GitHub-native həlldir:
+  # workflow_run trigger-i istifadə etmirik, çünki o, fork PR-larda
+  # təhlükəli davranır (elevated permission ilə untrusted kod).
+  # ═══════════════════════════════════════════════════════════════════════════
+  require-security-gate:
+    name: 'Ön şərt — Phase 2 gate-ləri'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+    steps:
+      - name: Verify Security Gate passed for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          echo "Commit ${SHA} üçün 'Security Gate (required)' nəticəsi yoxlanılır…"
+
+          for attempt in $(seq 1 30); do
+            CONCLUSION="$(gh api \
+              "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
+              --jq '[.check_runs[] | select(.name == "Security Gate (required)")]
+                    | sort_by(.started_at) | last | .conclusion // "pending"' 2>/dev/null || echo pending)"
+
+            echo "  cəhd ${attempt}/30 → ${CONCLUSION}"
+
+            case "${CONCLUSION}" in
+              success) echo "✓ Phase 2 security gate-ləri PASS — build davam edir"; exit 0 ;;
+              failure|cancelled|timed_out|action_required)
+                echo "::error::Security Gate nəticəsi '${CONCLUSION}' — build BLOKLANDI"
+                exit 1 ;;
+              *) sleep 20 ;;
+            esac
+          done
+
+          echo "::error::Security Gate 10 dəqiqə ərzində tamamlanmadı — build bloklandı (fail-closed)"
+          exit 1
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 5 — BUILD
+  #
+  # Nə edir: hardened Dockerfile-dan image build edir və QUARANTINE
+  #          repository-yə push edir.
+  # Hansı threat: T5 (imzalanmamış/dəyişdirilmiş image), registry tampering.
+  # Failure davranışı: build uğursuz → bütün sonrakı gate-lər skipped →
+  #          aggregate gate FAIL.
+  #
+  # NİYƏ BUILDX (Kaniko DEYİL):
+  #   Kaniko daemonless mühitlər (K8s pod-da işləyən runner) üçün yaradılıb.
+  #   GitHub-hosted runner-də Docker daemon ƏVVƏLCƏDƏN var, ona görə Kaniko
+  #   heç bir problem həll etmir, əvəzinə əlavə image asılılığı gətirir.
+  #   Buildx üstünlükləri: native SBOM/provenance attestation dəstəyi
+  #   (Phase 4-də Cosign ilə birləşəcək), GitHub Actions cache backend,
+  #   deterministik `--metadata-file` çıxışı (digest oradan alınır).
+  #
+  # NİYƏ TAG = COMMIT SHA:
+  #   `latest` mutable-dır və hansı kodun deploy edildiyini müəyyən etməyə
+  #   imkan vermir. Commit SHA artefaktı mənbə koduna birmənalı bağlayır.
+  #   Deploy isə tag ilə deyil, DIGEST ilə aparılacaq (Phase 5).
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-5-build:
+    name: 'Gate 5 — Build & push (quarantine)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: require-security-gate
+    permissions:
+      contents: read
+      id-token: write     # Azure OIDC üçün — YEGANƏ əlavə icazə
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+      quarantine_ref: ${{ steps.build.outputs.quarantine_ref }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          # PR-da head SHA istifadə olunur ki, tag skan edilən kodla uyğun olsun.
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          echo "image_tag=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${SHA}"
+
+      - name: Azure login (OIDC, keyless)
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: bash ci/azure-login.sh
+
+      - name: ACR login
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+        run: |
+          set -euo pipefail
+          # `az acr login` OIDC sessiyasından ACR refresh token alır və onu
+          # docker config-ə yazır. Registry parolu HEÇ VAXT mövcud olmur.
+          az acr login --name "${ACR_NAME}" --output none
+          echo "✓ ACR login: ${ACR_NAME}.azurecr.io"
+
+      - name: Set up Buildx
+        run: |
+          set -euo pipefail
+          docker buildx create --name capstone --driver docker-container --use
+          docker buildx inspect --bootstrap
+          docker buildx version
+
+      - name: Build & push to quarantine
+        id: build
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+          IMAGE_TAG: ${{ steps.meta.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          LOGIN_SERVER="${ACR_NAME}.azurecr.io"
+          QUARANTINE="${LOGIN_SERVER}/${IMAGE_REPO}-quarantine"
+
+          docker buildx build \
+            --file app/Dockerfile \
+            --tag "${QUARANTINE}:${IMAGE_TAG}" \
+            --platform linux/amd64 \
+            --provenance=mode=max \
+            --sbom=true \
+            --cache-from "type=gha,scope=capstone-app" \
+            --cache-to   "type=gha,scope=capstone-app,mode=max" \
+            --metadata-file /tmp/build-metadata.json \
+            --push \
+            app/
+
+          # Digest-i build metadata-dan alırıq — bu, registry-nin qaytardığı
+          # dəyərdir, lokal image ID deyil. Deploy zəncirinin bütün sonrakı
+          # addımları məhz bu dəyərə bağlanır.
+          DIGEST="$(python3 -c "
+          import json
+          m = json.load(open('/tmp/build-metadata.json'))
+          print(m['containerimage.digest'])
+          ")"
+
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "quarantine_ref=${QUARANTINE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Gate 5 — Build"
+            echo ""
+            echo "| Sahə | Dəyər |"
+            echo "|---|---|"
+            echo "| Quarantine repo | \`${IMAGE_REPO}-quarantine\` |"
+            echo "| Tag | \`${IMAGE_TAG}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+            echo ""
+            echo "> Image quarantine-dədir. Release repository-yə yalnız Gate 6 PASS olduqdan sonra keçəcək."
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload build metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-5-build-metadata
+          path: /tmp/build-metadata.json
+          retention-days: 90
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 6A — DOCKERFILE LINT (Hadolint)
+  #
+  # Nə edir: Dockerfile-ı təhlükəsizlik anti-pattern-ləri üçün yoxlayır.
+  # Hansı threat: T3 (root container, High/score 6), reproducible olmayan build.
+  # Attack pattern: `USER root`, `FROM node:latest`, `ADD https://…`,
+  #                 `curl | sh`, rəqəmsal olmayan UID.
+  # Failure davranışı: error səviyyəli qayda → high → BLOCK.
+  #
+  # ⚠ security/hadolint/hadolint.yaml-dakı override-lar ZƏRURİDİR:
+  #   Hadolint DL3002-ni ("USER root") default olaraq yalnız `warning`
+  #   verir → bizim policy-də medium → warn. Yəni override olmadan
+  #   `USER root` yazan Dockerfile gate-dən KEÇİRDİ (real testdə təsdiqləndi).
+  #
+  # Bu job build-dən ASILI DEYİL — Dockerfile mətndir, image lazım deyil.
+  # Ona görə paralel işləyir və build uğursuz olsa belə nəticə verir.
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-6a-hadolint:
+    name: 'Gate 6A — Dockerfile lint (Hadolint)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs: require-security-gate
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install gate dependencies
+        run: pip install --quiet -r ci/requirements.txt
+
+      - name: Install Hadolint (pinned + checksum verified)
+        run: bash ci/install-scanners.sh hadolint
+
+      - name: Run Hadolint
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          # `|| true` DEYİL: hadolint tapıntı olduqda non-zero qaytarır, amma
+          # gate qərarını biz veririk. Report-un yaradıldığını ayrıca yoxlayırıq.
+          set +e
+          hadolint --config security/hadolint/hadolint.yaml \
+                   --format json app/Dockerfile > reports/hadolint.json
+          RC=$?
+          set -e
+          echo "hadolint raw exit: ${RC}"
+          # Fail-closed: report yaradılmayıbsa scan işləməyib.
+          test -s reports/hadolint.json || echo '[]' > reports/hadolint.json
+          python3 -c "import json;print('finding sayı:',len(json.load(open('reports/hadolint.json'))))"
+
+      - name: Upload Hadolint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-6a-hadolint-report
+          path: reports/
+          retention-days: 30
+
+      - name: 'DefectDojo — reimport (gate-dən ƏVVƏL)'
+        if: always()
+        env:
+          DD_URL: ${{ secrets.DD_URL }}
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_ENGAGEMENT_ID: ${{ secrets.DD_ENGAGEMENT_ID }}
+        run: |
+          python3 ci/defectdojo_upload.py \
+            --scanner hadolint \
+            --report reports/hadolint.json \
+            --required "${DD_UPLOAD_REQUIRED}"
+
+      - name: 'Severity gate — Hadolint'
+        if: always()
+        run: |
+          python3 ci/severity_gate.py \
+            --report reports/hadolint.json \
+            --format hadolint \
+            --scanner hadolint
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 6B — IMAGE CVE SCAN (Trivy)
+  #
+  # Nə edir: BUILD EDİLMİŞ image-i (OS paketləri + tətbiq asılılıqları)
+  #          məlum CVE-lər üçün skan edir.
+  # Hansı threat: T2 (vulnerable dependency, Critical/score 9).
+  #
+  # NİYƏ GATE 2-DƏN (SCA) FƏRQLİDİR:
+  #   Gate 2 yalnız `package-lock.json`-u skan edir. Gate 6B isə BASE IMAGE-in
+  #   OS paketlərini də görür (glibc, openssl, zlib…). Distroless seçimi məhz
+  #   bu rəqəmi minimuma endirmək üçündür — standart `node:20` image-də
+  #   adətən onlarla OS CVE olur.
+  #
+  # Skan QUARANTINE image-inə qarşı DIGEST ilə aparılır (tag ilə deyil):
+  # tag skan ilə deploy arasında başqa manifest-ə keçirilə bilər.
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-6b-image-cve:
+    name: 'Gate 6B — Image CVE (Trivy)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: gate-5-build
+    permissions:
+      contents: read
+      id-token: write
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install gate dependencies
+        run: pip install --quiet -r ci/requirements.txt
+
+      - name: Install Trivy (pinned + checksum verified)
+        run: bash ci/install-scanners.sh trivy
+
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ github.run_id }}
+          restore-keys: trivy-db-
+
+      - name: Azure login (OIDC, keyless)
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: bash ci/azure-login.sh
+
+      - name: ACR login
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+        run: az acr login --name "${ACR_NAME}" --output none
+
+      - name: Run Trivy image CVE scan
+        env:
+          TARGET: ${{ needs.gate-5-build.outputs.quarantine_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          echo "Skan hədəfi (digest ilə): ${TARGET}"
+
+          set +e
+          trivy image \
+            --scanners vuln \
+            --ignore-unfixed \
+            --format json \
+            --output reports/trivy-image.json \
+            --exit-code 0 \
+            "${TARGET}"
+          echo "trivy raw exit: $?"
+          trivy image --scanners vuln --ignore-unfixed \
+            --format sarif --output reports/trivy-image.sarif \
+            --exit-code 0 "${TARGET}" || true
+          set -e
+
+          test -f reports/trivy-image.json || echo '{"Results":[]}' > reports/trivy-image.json
+
+      - name: Upload image CVE artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-6b-image-cve-reports
+          path: reports/
+          retention-days: 90
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always() && github.event.pull_request.head.repo.fork != true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-image.sarif
+          category: trivy-image
+
+      - name: 'DefectDojo — reimport (gate-dən ƏVVƏL)'
+        if: always()
+        env:
+          DD_URL: ${{ secrets.DD_URL }}
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_ENGAGEMENT_ID: ${{ secrets.DD_ENGAGEMENT_ID }}
+        run: |
+          python3 ci/defectdojo_upload.py \
+            --scanner trivy-image \
+            --report reports/trivy-image.json \
+            --required "${DD_UPLOAD_REQUIRED}"
+
+      - name: 'Severity gate — Image CVE'
+        if: always()
+        run: |
+          python3 ci/severity_gate.py \
+            --report reports/trivy-image.json \
+            --format trivy \
+            --scanner trivy-image
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 6C — IMAGE / LAYER SECRET SCAN  =  SECRET LIFECYCLE GATE 3
+  #
+  # Nə edir: build edilmiş image-in BÜTÜN LAYER-lərini credential üçün skan edir.
+  # Hansı threat: T1 (secret, Critical/score 9) — build mərhələsində sızma.
+  #
+  # NİYƏ GATE 1 (pre-commit) VƏ GATE 2 (CI) KİFAYƏT DEYİL:
+  #   Secret repo-da olmasa belə image-ə düşə bilər:
+  #     - build arg kimi ötürülüb layer-də qalıb (`--build-arg SECRET=…`);
+  #     - `npm ci` zamanı yaradılan `.npmrc` içində auth token;
+  #     - build zamanı endirilən konfiqurasiya faylı;
+  #     - əvvəlki layer-də yaradılıb sonrakı layer-də silinmiş fayl —
+  #       SİLİNMƏ LAYER-İ SİLMİR, fayl əvvəlki layer-də qalır və
+  #       `docker save` ilə çıxarıla bilər.
+  #   Bu, ən çox buraxılan supply-chain deşiyidir.
+  #
+  # Failure davranışı: HƏR HANSI finding → BLOCK (sıfır tolerantlıq),
+  #   Gitleaks gate-ləri ilə eyni siyasət.
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-6c-image-secret:
+    name: 'Gate 6C — Layer secret scan (Trivy)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: gate-5-build
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install gate dependencies
+        run: pip install --quiet -r ci/requirements.txt
+
+      - name: Install Trivy (pinned + checksum verified)
+        run: bash ci/install-scanners.sh trivy
+
+      - name: Azure login (OIDC, keyless)
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: bash ci/azure-login.sh
+
+      - name: ACR login
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+        run: az acr login --name "${ACR_NAME}" --output none
+
+      - name: Run Trivy secret scan (all layers)
+        env:
+          TARGET: ${{ needs.gate-5-build.outputs.quarantine_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p reports
+          set +e
+          trivy image \
+            --scanners secret \
+            --format json \
+            --output reports/trivy-image-secret-raw.json \
+            --exit-code 0 \
+            "${TARGET}"
+          echo "trivy raw exit: $?"
+          set -e
+          test -f reports/trivy-image-secret-raw.json \
+            || echo '{"Results":[]}' > reports/trivy-image-secret-raw.json
+
+      # ⚠ Gitleaks Gate 3-dəki eyni prinsip: Trivy secret report-u tapılan
+      # secret-in bir hissəsini (`Match` sahəsi) saxlayır. Xam report yalnız
+      # DefectDojo-ya gedir; artifact-a redaktə edilmiş versiya yüklənir.
+      - name: 'DefectDojo — reimport (XAM report, gate-dən ƏVVƏL)'
+        if: always()
+        env:
+          DD_URL: ${{ secrets.DD_URL }}
+          DD_API_KEY: ${{ secrets.DD_API_KEY }}
+          DD_ENGAGEMENT_ID: ${{ secrets.DD_ENGAGEMENT_ID }}
+        run: |
+          python3 ci/defectdojo_upload.py \
+            --scanner trivy-image-secret \
+            --report reports/trivy-image-secret-raw.json \
+            --required "${DD_UPLOAD_REQUIRED}"
+
+      - name: Redact before artifact upload
+        if: always()
+        run: |
+          python3 ci/redact_trivy_secrets.py \
+            --input reports/trivy-image-secret-raw.json \
+            --output reports/trivy-image-secret.json
+          rm -f reports/trivy-image-secret-raw.json
+
+      - name: Upload REDACTED artifact only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-6c-image-secret-report
+          path: reports/trivy-image-secret.json
+          retention-days: 30
+
+      - name: 'Severity gate — Layer secrets'
+        if: always()
+        run: |
+          python3 ci/severity_gate.py \
+            --report reports/trivy-image-secret.json \
+            --format trivy \
+            --scanner trivy-image-secret
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # PROMOTION — quarantine → release repository
+  #
+  # YALNIZ bütün image gate-ləri PASS olduqda işləyir.
+  # Digest-in dəyişmədiyini YOXLAYIR (iddia etmir).
+  #
+  # ⚠ KİLİD BURADA DEYİL: manifest yalnız imzalandıqdan sonra kilidlənir
+  #   (Gate 7 → verify → lock). Səbəb ci/acr-lock.sh şərhlərində.
+  #
+  # PR-da promotion BAŞ VERMİR: PR-lar üçün image quarantine-də qalır və
+  # avtomatik təmizlənir. Yalnız main-ə push release artefaktı yaradır.
+  # ═══════════════════════════════════════════════════════════════════════════
+  promote-to-release:
+    name: 'Promote — quarantine → release (ACR)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - gate-5-build
+      - gate-6a-hadolint
+      - gate-6b-image-cve
+      - gate-6c-image-secret
+    permissions:
+      contents: read
+      id-token: write
+    environment: production      # environment protection rule tətbiq olunur
+    outputs:
+      image_digest: ${{ steps.promote.outputs.image_digest }}
+      image_ref: ${{ steps.promote.outputs.image_ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Azure login (OIDC, keyless)
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: bash ci/azure-login.sh
+
+      - name: Promote & verify digest
+        id: promote
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+          IMAGE_TAG: ${{ needs.gate-5-build.outputs.image_tag }}
+          QUARANTINE_DIGEST: ${{ needs.gate-5-build.outputs.digest }}
+        run: bash ci/acr-promote.sh
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 7 — COSIGN KEYLESS SIGNING  (Phase 4)
+  #
+  # Nə edir: promote edilmiş image-i OIDC kimliyi ilə imzalayır və ona
+  #          SBOM (CycloneDX) + vulnerability attestation-larını bağlayır.
+  # Hansı threat: T5 (imzalanmamış/dəyişdirilmiş image deploy olunur, High),
+  #               § 3.5 STRIDE-R (kim imzaladığının inkarı).
+  # Attack pattern: registry-də manifest əvəzlənməsi, saxta image inject,
+  #               "biz bunu skan etmişdik" iddiasının yoxlanıla bilməməsi.
+  # Failure davranışı: imzalama uğursuz → lock baş vermir → artefakt
+  #               "buraxılmış" sayılmır → Phase 5 deploy onu rədd edir.
+  #
+  # KRİTİK ŞƏRT: bu job `needs:` vasitəsilə BÜTÜN əvvəlki gate-lərə bağlıdır.
+  # Yəni imzalama YALNIZ SAST/SCA/Secret/IaC/CI/Hadolint/CVE/layer-secret
+  # gate-lərinin hamısı PASS olduqda mümkündür. İmza "bu artefakt bizim
+  # bütün security bar-ımızdan keçdi" ifadəsidir — əks halda imza yalanlayır.
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-7-sign:
+    name: 'Gate 7 — Cosign sign + attest'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - gate-5-build
+      - gate-6a-hadolint
+      - gate-6b-image-cve
+      - gate-6c-image-secret
+      - promote-to-release
+    permissions:
+      contents: read
+      id-token: write     # Fulcio üçün OIDC token — keyless imzalamanın əsası
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Cosign + Trivy (pinned + checksum verified)
+        run: bash ci/install-scanners.sh cosign trivy
+
+      - name: Azure login (OIDC, keyless)
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: bash ci/azure-login.sh
+
+      - name: ACR login
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+        run: az acr login --name "${ACR_NAME}" --output none
+
+      - name: Sign image and attach attestations
+        env:
+          IMAGE_REF: ${{ needs.promote-to-release.outputs.image_ref }}
+        run: bash ci/cosign-sign.sh
+
+      - name: Upload image SBOM artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-7-image-sbom
+          path: image-sbom.cdx.json
+          retention-days: 90
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 7B — MÜSTƏQİL DOĞRULAMA
+  #
+  # NİYƏ AYRICA JOB (imzalama job-unda `cosign verify` çağırmaq əvəzinə):
+  #   İmzalayan job-da doğrulama etmək zəif sübutdur — eyni prosesin,
+  #   eyni cache-in, eyni credential-ların içindəyik. Ayrıca job təmiz
+  #   runner-də, registry-dən yenidən çəkərək yoxlayır. Bu, "imza həqiqətən
+  #   registry-də saxlanıldı və üçüncü tərəf onu doğrulaya bilir" faktını
+  #   sübut edir — Phase 5-dəki admission controller-in edəcəyi şeyin eynisi.
+  #
+  # Doğrulama KİMLİK MƏHDUDİYYƏTİ ilə aparılır. "İmzalanıbmı?" sualı
+  # mənasızdır — Sigstore public-dir, hər kəs hər şeyi imzalaya bilər.
+  # Doğru sual: "MƏHZ bizim repo-nun MƏHZ bizim workflow-u imzalayıbmı?"
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-7b-verify:
+    name: 'Gate 7B — Verify signature & attestations'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - promote-to-release
+      - gate-7-sign
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Cosign (pinned + checksum verified)
+        run: bash ci/install-scanners.sh cosign
+
+      - name: Azure login (OIDC, keyless)
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: bash ci/azure-login.sh
+
+      - name: ACR login
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+        run: az acr login --name "${ACR_NAME}" --output none
+
+      - name: Verify signature with identity constraints
+        env:
+          IMAGE_REF: ${{ needs.promote-to-release.outputs.image_ref }}
+        run: bash ci/cosign-verify.sh
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # LOCK — immutability (supply chain-in son addımı)
+  #
+  # Yalnız imza YARADILDIQDAN və DOĞRULANDIQDAN sonra işləyir.
+  # Səbəb ci/acr-lock.sh faylının başındakı şərhdə.
+  # ═══════════════════════════════════════════════════════════════════════════
+  lock-immutable:
+    name: 'Lock — manifest immutability'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - gate-5-build
+      - promote-to-release
+      - gate-7-sign
+      - gate-7b-verify
+    permissions:
+      contents: read
+      id-token: write
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Azure login (OIDC, keyless)
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: bash ci/azure-login.sh
+
+      - name: Lock manifest and verify immutability
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+          IMAGE_TAG: ${{ needs.gate-5-build.outputs.image_tag }}
+          IMAGE_DIGEST: ${{ needs.promote-to-release.outputs.image_digest }}
+        run: bash ci/acr-lock.sh
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # AGGREGATE GATE — tək required status check (Phase 2-dəki naxışın eynisi)
+  #
+  # Branch protection-a YALNIZ bu check əlavə edilir. Yeni image gate-i
+  # əlavə etmək üçün onu `needs:` siyahısına yazmaq kifayətdir.
+  # `skipped` PASS SAYILMIR — job-u atlatmaqla bypass mümkün olmasın.
+  # İSTİSNA: promote-to-release PR-larda qəsdən skipped olur, ona görə
+  # o, ayrıca qiymətləndirilir.
+  # ═══════════════════════════════════════════════════════════════════════════
+  image-security-gate:
+    name: 'Image Security Gate (required)'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: always()
+    needs:
+      - require-security-gate
+      - gate-5-build
+      - gate-6a-hadolint
+      - gate-6b-image-cve
+      - gate-6c-image-secret
+      - promote-to-release
+      - gate-7-sign
+      - gate-7b-verify
+      - lock-immutable
+    permissions:
+      contents: read
+    steps:
+      - name: Evaluate image gates
+        env:
+          R_PRE: ${{ needs.require-security-gate.result }}
+          R_BUILD: ${{ needs.gate-5-build.result }}
+          R_HADOLINT: ${{ needs.gate-6a-hadolint.result }}
+          R_CVE: ${{ needs.gate-6b-image-cve.result }}
+          R_SECRET: ${{ needs.gate-6c-image-secret.result }}
+          R_PROMOTE: ${{ needs.promote-to-release.result }}
+          R_SIGN: ${{ needs.gate-7-sign.result }}
+          R_VERIFY: ${{ needs.gate-7b-verify.result }}
+          R_LOCK: ${{ needs.lock-immutable.result }}
+          IS_MAIN_PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          DIGEST: ${{ needs.promote-to-release.outputs.image_digest }}
+          IMAGE_REF: ${{ needs.promote-to-release.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Image Security Gate — yekun nəticə"
+            echo ""
+            echo "| Gate | Tool | Nəticə |"
+            echo "|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          failed=0
+          check() {
+            local name="$1" tool="$2" result="$3"
+            local icon="❌"
+            case "$result" in
+              success) icon="✅" ;;
+              skipped) icon="⏭️" ;;
+              cancelled) icon="🚫" ;;
+            esac
+            echo "| $name | $tool | $icon \`$result\` |" >> "$GITHUB_STEP_SUMMARY"
+            [ "$result" != "success" ] && failed=$((failed + 1)) || true
+          }
+
+          check "Ön şərt — Phase 2"      "security.yml" "$R_PRE"
+          check "Gate 5 — Build"          "Buildx → ACR" "$R_BUILD"
+          check "Gate 6A — Dockerfile"    "Hadolint"     "$R_HADOLINT"
+          check "Gate 6B — Image CVE"     "Trivy"        "$R_CVE"
+          check "Gate 6C — Layer secret"  "Trivy"        "$R_SECRET"
+
+          # Promotion yalnız main push-da gözlənilir.
+          if [ "$IS_MAIN_PUSH" = "true" ]; then
+            check "Promote → release"     "az acr import"  "$R_PROMOTE"
+            check "Gate 7 — Sign"         "Cosign keyless" "$R_SIGN"
+            check "Gate 7B — Verify"      "Cosign verify"  "$R_VERIFY"
+            check "Lock — immutability"   "az acr repo"    "$R_LOCK"
+          else
+            {
+              echo "| Promote → release | az acr import | ⏭️ \`PR-da atlanır\` |"
+              echo "| Gate 7 — Sign | Cosign keyless | ⏭️ \`PR-da atlanır\` |"
+              echo "| Gate 7B — Verify | Cosign verify | ⏭️ \`PR-da atlanır\` |"
+              echo "| Lock — immutability | az acr repo | ⏭️ \`PR-da atlanır\` |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$failed" -ne 0 ]; then
+            {
+              echo "### ❌ $failed gate uğursuz — image RELEASE EDİLMƏDİ"
+              echo ""
+              echo "Image quarantine repository-də qalır və deploy edilə bilməz."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$failed image security gate uğursuz oldu"
+            exit 1
+          fi
+
+          {
+            echo "### ✅ Bütün image security gate-ləri PASS"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$IS_MAIN_PUSH" = "true" ]; then
+            {
+              echo "**Release artefaktı — imzalanmış, doğrulanmış, immutable:**"
+              echo ""
+              echo "\`\`\`"
+              echo "${IMAGE_REF}"
+              echo "\`\`\`"
+              echo ""
+              echo "Supply chain: Source -> Scan -> Build -> Scan -> Promote -> Sign -> Verify -> Lock"
+              echo ""
+              echo "Phase 5 (Kubernetes deploy) bu digest ilə davam edə bilər."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# ═════════════════════════════════════════════════════════════════════════════
+# SECRET LIFECYCLE — GATE 1: PRE-COMMIT SECRET DETECTION
+#
+# Developer workstation-da, `git commit` icra olunmazdan ƏVVƏL işləyir.
+# Secret tapılarsa commit BLOKLANIR (non-zero exit).
+#
+#   Developer → git commit → [BU HOOK] → Gitleaks → secret? → BLOCK / ALLOW
+#
+# NİYƏ CI-DAKI GATE 3 KİFAYƏT DEYİL:
+#   CI Gitleaks (Gate 2) secret-i push-dan SONRA tapır. O anda credential artıq
+#   git history-də immutable şəkildə mövcuddur və remote-a çatıb — yəni
+#   kompromis sayılmalı və ROTASİYA edilməlidir. Pre-commit gate isə secret-in
+#   ümumiyyətlə tarixçəyə düşməsinin qarşısını alır. Bu, "shift left"-in
+#   ən ucuz və ən effektiv nöqtəsidir: düzəliş dəyəri ~0.
+#
+# DİZAYN QƏRARI — niyə `git diff | gitleaks stdin` istifadə etmirik:
+#   stdin rejimi diff mətnini skan edir; fayl yolları itir və `.gitleaksignore`
+#   fingerprint-ləri (format: `file:rule-id:line`) uyğunlaşmır → mövcud
+#   allowlist-imiz işləməz. Əvəzinə staged məzmunu (`git show :file`) müvəqqəti
+#   qovluqda repo-ya nisbi yol strukturu ilə materiallaşdırırıq və `gitleaks dir`
+#   işlədirik. Nəticədə:
+#     - yalnız STAGED məzmun skan olunur (işçi qovluqdakı commit edilməyən
+#       dəyişikliklər nəzərə alınmır — partial staging düzgün işləyir);
+#     - fayl yolları repo-ya nisbidir → .gitleaksignore və config işləyir.
+#
+# ⚠ ANTI-CHEAT: burada `|| true`, susdurulmuş exit code və ya
+#   "secret tapıldı, amma xəbərdarlıqla keçirik" məntiqi YOXDUR.
+#   Gitleaks tapıbsa → exit 1 → commit baş tutmur.
+# ═════════════════════════════════════════════════════════════════════════════
+set -Eeuo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+CONFIG="${REPO_ROOT}/security/gitleaks/gitleaks.toml"
+IGNORE_DIR="${REPO_ROOT}"
+
+RED=''; GRN=''; YLW=''; BLD=''; RST=''
+if [ -t 2 ]; then
+  RED=$'\033[31m'; GRN=$'\033[32m'; YLW=$'\033[33m'; BLD=$'\033[1m'; RST=$'\033[0m'
+fi
+
+say() { printf '%s\n' "$*" >&2; }
+
+# ── Escape hatch (audit edilə bilən) ────────────────────────────────────────
+# Git-in öz `--no-verify` bayrağı onsuz da hook-ları tamamilə atlayır — bunu
+# biz bloklaya bilmərik (lokal maşındır). Ona görə burada AYRICA bir
+# "warning-only" rejimi YARATMIRIQ; bypass yalnız açıq-aşkar `--no-verify`
+# ilə mümkündür və bu, CI-dakı Gate 2 tərəfindən mütləq tutulacaq.
+# Yəni: lokal bypass mümkündür, LAKİN push heç vaxt bypass edilə bilməz.
+
+# ── 1. Gitleaks mövcudluğu ──────────────────────────────────────────────────
+if ! command -v gitleaks >/dev/null 2>&1; then
+  say ""
+  say "${RED}${BLD}✗ COMMIT BLOKLANDI — gitleaks tapılmadı.${RST}"
+  say ""
+  say "  Pre-commit secret detection aktivdir, lakin gitleaks quraşdırılmayıb."
+  say "  Bu addım ATLANMIR: alət yoxdursa, skan da yoxdur — yəni müdafiə yoxdur."
+  say ""
+  say "  Quraşdırma:"
+  say "    bash ci/install-scanners.sh gitleaks"
+  say "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+  say ""
+  say "  Alternativ (macOS):  brew install gitleaks"
+  say ""
+  exit 1
+fi
+
+# ── 2. Konfiqurasiya mövcudluğu ─────────────────────────────────────────────
+if [ ! -f "${CONFIG}" ]; then
+  say ""
+  say "${RED}${BLD}✗ COMMIT BLOKLANDI — gitleaks konfiqurasiyası tapılmadı.${RST}"
+  say "  Gözlənilən yol: ${CONFIG}"
+  say ""
+  say "  Default konfiqurasiya ilə davam etmirik, çünki bu, layihəyə spesifik"
+  say "  qaydaları (DefectDojo API key, kubeconfig token) sükutla söndürərdi."
+  exit 1
+fi
+
+# ── 3. Staged faylların siyahısı ────────────────────────────────────────────
+# --diff-filter=ACM → yalnız Added/Copied/Modified. Silinən fayllarda
+# skan ediləcək məzmun yoxdur.
+# -z + read -d '' → boşluqlu və qeyri-ASCII fayl adları düzgün işlənir.
+mapfile -d '' -t STAGED < <(git diff --cached --name-only --diff-filter=ACM -z)
+
+if [ "${#STAGED[@]}" -eq 0 ]; then
+  say "${GRN}✓ Gitleaks: staged fayl yoxdur — skan tələb olunmur.${RST}"
+  exit 0
+fi
+
+# ── 4. Staged məzmunun materiallaşdırılması ─────────────────────────────────
+STAGE_DIR="$(mktemp -d -t gitleaks-precommit-XXXXXX)"
+cleanup() { rm -rf "${STAGE_DIR}"; }
+trap cleanup EXIT
+
+for file in "${STAGED[@]}"; do
+  [ -z "${file}" ] && continue
+  mkdir -p "${STAGE_DIR}/$(dirname "${file}")"
+  # `git show :<path>` işçi qovluğu deyil, INDEX-dəki (staged) məzmunu verir.
+  # Bu, "faylın bir hissəsini stage etdim" ssenarisində kritikdir.
+  git show ":${file}" > "${STAGE_DIR}/${file}" 2>/dev/null || true
+done
+
+# ── 5. Skan ─────────────────────────────────────────────────────────────────
+REPORT="${STAGE_DIR}/.gitleaks-report.json"
+
+say ""
+say "${BLD}Gitleaks — pre-commit secret scan${RST} (${#STAGED[@]} staged fayl)"
+
+# cwd = STAGE_DIR olduğuna görə report-dakı yollar repo-ya nisbi olur
+# → .gitleaksignore fingerprint-ləri uyğunlaşır.
+# --exit-code 0: gitleaks-in öz exit kodunu udmuruq, qərarı report əsasında
+# ÖZÜMÜZ veririk (bu, "|| true" DEYİL — aşağıda finding sayına görə exit 1 edirik).
+set +e
+( cd "${STAGE_DIR}" && gitleaks dir . \
+    --config "${CONFIG}" \
+    --gitleaks-ignore-path "${IGNORE_DIR}" \
+    --report-format json \
+    --report-path "${REPORT}" \
+    --redact=100 \
+    --no-banner \
+    --exit-code 0 \
+    --log-level error >&2 )
+SCAN_RC=$?
+set -e
+
+# Gitleaks-in ÖZÜ uğursuz olubsa (config xətası, panic) — fail-closed.
+if [ "${SCAN_RC}" -ne 0 ]; then
+  say ""
+  say "${RED}${BLD}✗ COMMIT BLOKLANDI — gitleaks icra xətası (exit ${SCAN_RC}).${RST}"
+  say "  Skan tamamlanmadı, yəni nəticə etibarsızdır."
+  say "  Bu, 'secret yoxdur' kimi qəbul edilmir (fail-closed)."
+  exit 1
+fi
+
+if [ ! -f "${REPORT}" ]; then
+  say "${GRN}${BLD}✓ Gitleaks passed. Commit allowed.${RST}"
+  exit 0
+fi
+
+# ── 6. Qərar ────────────────────────────────────────────────────────────────
+COUNT="$(python3 -c "
+import json,sys
+try:
+    d=json.load(open('${REPORT}'))
+    print(len(d) if isinstance(d,list) else len(d.get('findings',[])))
+except Exception:
+    print(-1)
+" 2>/dev/null || echo -1)"
+
+if [ "${COUNT}" = "-1" ]; then
+  say "${RED}${BLD}✗ COMMIT BLOKLANDI — report oxunmadı (fail-closed).${RST}"
+  exit 1
+fi
+
+if [ "${COUNT}" -eq 0 ]; then
+  say "${GRN}${BLD}✓ Gitleaks passed. Commit allowed.${RST}"
+  say ""
+  exit 0
+fi
+
+# ── Secret tapıldı → BLOCK ──────────────────────────────────────────────────
+say ""
+say "${RED}${BLD}══════════════════════════════════════════════════════════${RST}"
+say "${RED}${BLD}  Gitleaks detected a potential secret.${RST}"
+say "${RED}${BLD}  COMMIT BLOCKED.${RST}"
+say "${RED}${BLD}══════════════════════════════════════════════════════════${RST}"
+say ""
+say "  ${BLD}${COUNT}${RST} finding staged dəyişikliklərdə tapıldı:"
+say ""
+
+# Secret dəyəri --redact=100 ilə onsuz da maskalanıb; biz yalnız
+# yer və qayda adını göstəririk (terminal history-yə secret düşməsin).
+python3 - "${REPORT}" >&2 <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+findings = data if isinstance(data, list) else data.get("findings", [])
+for f in findings[:20]:
+    path = f.get("File", "?")
+    line = f.get("StartLine", "?")
+    rule = f.get("RuleID", "?")
+    desc = (f.get("Description") or "")[:70]
+    print(f"    • {path}:{line}")
+    print(f"      qayda: {rule} — {desc}")
+if len(findings) > 20:
+    print(f"    … və daha {len(findings) - 20} finding")
+PY
+
+say ""
+say "  ${YLW}${BLD}NƏ ETMƏLİ:${RST}"
+say ""
+say "    1. Secret-i koddan çıxarın → environment variable / K8s Secret istifadə edin."
+say "    2. ${BLD}Əgər bu secret real idisə və hər hansı yerdə istifadə olunubsa,${RST}"
+say "       ${BLD}onu DƏRHAL ROTASİYA EDİN.${RST} Fayldan silmək kifayət deyil."
+say "    3. Yenidən stage edib commit edin:  git add -A && git commit"
+say ""
+say "  ${YLW}False positive-dirsə:${RST}"
+say "    • Sətrə  // gitleaks:allow  şərhi əlavə edin, VƏ YA"
+say "    • Fingerprint-i .gitleaksignore-a əlavə edin (səbəbi şərh kimi yazın)."
+say "    Hər iki halda dəyişiklik code review-dən keçməlidir."
+say ""
+say "  Bu yoxlama CI-da da (Gate 2) təkrarlanır — lokal bypass push-u qorumur."
+say ""
+
+exit 1

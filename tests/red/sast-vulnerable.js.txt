@@ -1,0 +1,32 @@
+'use strict';
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const { exec } = require('child_process');
+
+// RED TEST 1 — hardcoded secret
+const apiKey = "DUMMY-NOT-A-REAL-SECRET-sast-fixture-0001";
+
+// RED TEST 2 — CORS wildcard
+const app = express();
+app.use(cors({ origin: "*" }));
+
+// RED TEST 3 — helmet CSP söndürülüb
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// RED TEST 4 — limitsiz body parser
+app.use(express.json());
+
+// RED TEST 5 — command injection
+app.get('/ping', (req, res) => {
+  exec("ping -c 1 " + req.query.host, (e, out) => res.send(out));
+});
+
+// RED TEST 6 — eval
+app.post('/calc', (req, res) => res.json({ r: eval(req.body.expr) }));
+
+// RED TEST 7 — stack trace sızması
+app.use((err, req, res, next) => {
+  res.status(500).json({ error: 'x', stack: err.stack });
+});
+module.exports = app;

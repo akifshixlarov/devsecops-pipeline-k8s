@@ -1,0 +1,206 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# HARDENED DEPLOYMENT
+#
+# Hər security control-un yanında NƏ ETDİYİ, HANSI THREAT-i azaltdığı və
+# POZULARSA nə baş verdiyi izah olunub.
+# ═════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: capstone-app
+  namespace: capstone
+  labels:
+    app.kubernetes.io/name: capstone-app
+    app.kubernetes.io/component: api
+  annotations:
+    # Deploy izlənilə bilən olsun: hansı commit, hansı pipeline run.
+    # Auditability (threat model § 3.7 STRIDE-R).
+    capstone.io/git-commit: "__GIT_COMMIT__"
+    capstone.io/pipeline-run: "__PIPELINE_RUN_URL__"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 3
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: capstone-app
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0    # deploy zamanı kəsilmə olmasın
+      maxSurge: 1
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: capstone-app
+        app.kubernetes.io/component: api
+    spec:
+      serviceAccountName: app-sa
+
+      # ── Token mount edilmir ────────────────────────────────────────────────
+      # ServiceAccount-da da təyin edilib, burada TƏKRARLANIR.
+      # Səbəb: pod spec-dəki dəyər SA-dakını override edir. Əgər yalnız SA-da
+      # yazılsaydı, kimsə pod spec-ə `automountServiceAccountToken: true`
+      # əlavə edərək müdafiəni sükutla ləğv edə bilərdi.
+      # Mitiqasiya: tətbiq RCE-si → K8s API-yə çıxış (§ 3.8 STRIDE-E).
+      automountServiceAccountToken: false
+
+      # ── Pod səviyyəsində securityContext ───────────────────────────────────
+      securityContext:
+        # Konteyner root kimi işləyə bilməz. Threat model T3 (High, score 6).
+        # POZULARSA: container escape halında hücumçu birbaşa root olur.
+        runAsNonRoot: true
+
+        # RƏQƏMSAL UID/GID — simvolik ad DEYİL.
+        # Phase 3-də Hadolint (DL3066) məhz bunu tapdı: kubelet simvolik adı
+        # doğrulaya bilmir və pod `CreateContainerConfigError` verir:
+        #   "container has runAsNonRoot and image has non-numeric user"
+        # 65532 = distroless ":nonroot" istifadəçisi (app/Dockerfile ilə eyni).
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+
+        # Syscall filtri. RuntimeDefault container runtime-ın standart
+        # seccomp profilini tətbiq edir və təhlükəli syscall-ları bloklayır.
+        # POZULARSA (`Unconfined`): kernel exploit səthi kəskin genişlənir.
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: app
+          # ⚠ DIGEST — TAG DEYİL.
+          # ci/k8s-deploy.sh bu placeholder-i Phase 4-dən gələn imzalanmış
+          # digest ilə əvəz edir və tag formatını REDD EDİR.
+          # Səbəb: tag mutable-dır — `app:abc123` bu gün skan+imzalanmış image,
+          # sabah başqa məzmun ola bilər. Digest məzmunun özüdür.
+          image: "__IMAGE_REF__"
+
+          # Digest istifadə olunduğu üçün `Always` lazımsız şəbəkə trafikidir:
+          # digest dəyişməzdir, ona görə cache-dəki nüsxə həmişə düzgündür.
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+
+          # ── Konteyner səviyyəsində securityContext ───────────────────────
+          securityContext:
+            # Proses əlavə imtiyaz qazana bilməz (setuid binary-lər, file
+            # capabilities). POZULARSA: sudo/setuid vasitəsilə eskalasiya.
+            allowPrivilegeEscalation: false
+
+            # Root fayl sistemi YAZILA BİLMƏZ.
+            # Mitiqasiya: runtime-da binary dəyişdirilməsi, webshell yazılması,
+            # zərərli alət endirilməsi (§ 3.8 STRIDE-T).
+            # POZULARSA: hücumçu konteyner daxilində persistence qura bilir.
+            readOnlyRootFilesystem: true
+
+            # Bütün Linux capability-lər silinir. Tətbiq 3000 portunda
+            # (>1024) dinləyir, ona görə NET_BIND_SERVICE də lazım deyil.
+            capabilities:
+              drop:
+                - ALL
+
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile:
+              type: RuntimeDefault
+
+          # ── Resurs limitləri ─────────────────────────────────────────────
+          # requests: planlaşdırma üçün zəmanət.
+          # limits: "noisy neighbor" DoS-un qarşısını alır (§ 3.7 STRIDE-D).
+          #
+          # Qeyd: CPU limit-i QƏSDƏN qoyulmayıb. CPU throttling Node.js-də
+          # event loop gecikmələrinə səbəb olur və faydadan çox zərər verir;
+          # CPU sıxılan resursdur (compressible) — limit olmadan da pod
+          # digərlərini "öldürə" bilmir, sadəcə yavaşlayır.
+          # Memory isə sıxılmayan resursdur — limit MÜTLƏQ lazımdır, əks halda
+          # yaddaş sızması bütün node-u OOM-a salır.
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              memory: 256Mi
+              ephemeral-storage: 512Mi
+
+          # ── Probe-lar ────────────────────────────────────────────────────
+          # startupProbe: yavaş başlanğıcda liveness-in pod-u öldürməsinin
+          # qarşısını alır. Bu olmadan liveness çox aqressiv olur və
+          # CrashLoopBackOff yaradır.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 3
+            failureThreshold: 10
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: PORT
+              value: "3000"
+            - name: LOG_LEVEL
+              value: "info"
+            # TRUST_PROXY: yalnız Ingress/LoadBalancer arxasında true olmalıdır.
+            # False olduqda X-Forwarded-* header spoofing mümkün deyil
+            # (Phase 1 app/src/app.js dizaynı).
+            - name: TRUST_PROXY
+              value: "false"
+
+          # ── Yazıla bilən yollar ──────────────────────────────────────────
+          # readOnlyRootFilesystem: true olduğu üçün prosesin yaza biləcəyi
+          # yeganə yerlər açıq şəkildə göstərilməlidir.
+          # emptyDir + Memory: disk-ə heç nə yazılmır, pod silindikdə iz qalmır.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
+
+      # ── Şəbəkə hardening ─────────────────────────────────────────────────
+      # Pod host-un şəbəkə/PID/IPC namespace-lərini paylaşmır.
+      # PSS `restricted` bunu onsuz da tələb edir; burada açıq yazılması
+      # niyyəti sənədləşdirir və PSS söndürülsə belə müdafiəni saxlayır.
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+
+      # DNS sorğularını azaldır (ndots problemi) və şəbəkə səthini kiçildir.
+      dnsPolicy: ClusterFirst
+
+      terminationGracePeriodSeconds: 30
+
+      # Replica-lar müxtəlif node-larda yerləşsin — tək node itkisi
+      # tətbiqi tamamilə dayandırmasın.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: capstone-app

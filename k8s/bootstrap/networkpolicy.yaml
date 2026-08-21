@@ -1,0 +1,155 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# NETWORK POLICIES
+#
+# Threat model: T9 — NetworkPolicy yoxdur → lateral movement mümkündür (Medium).
+#
+# ⚠ ƏN VACİB ANLAYIŞ: Kubernetes-də default davranış "hamıya icazə"dir.
+#   NetworkPolicy olmayan namespace-də İSTƏNİLƏN pod İSTƏNİLƏN pod-a
+#   müraciət edə bilər — hətta başqa namespace-dən. Yəni bir tətbiqin
+#   kompromisi bütün cluster-in kəşfiyyatına çevrilir.
+#
+#   NetworkPolicy "additive"-dir: pod-a bir dənə də policy tətbiq olunan
+#   kimi, həmin istiqamət (ingress/egress) üçün default DENY olur və yalnız
+#   açıq şəkildə icazə verilmiş trafik keçir.
+#
+# ⚠ AKS TƏLƏBİ: cluster `--network-policy azure` (və ya `cilium`) ilə
+#   yaradılmalıdır. Bu parametr OLMADAN NetworkPolicy obyektləri qəbul
+#   olunur, LAKİN HEÇ BİR TƏSİR GÖSTƏRMİR — yəni "policy var" görünür,
+#   əslində isə heç nə bloklanmır. Bu, sükutla yanlış təhlükəsizlik hissi
+#   yaradan ən təhlükəli konfiqurasiya səhvlərindəndir.
+#   Yoxlama: az aks show ... --query networkProfile.networkPolicy
+# ═════════════════════════════════════════════════════════════════════════════
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. DEFAULT DENY — bütün ingress VƏ egress
+#
+# podSelector: {} → namespace-dəki BÜTÜN pod-lara tətbiq olunur.
+# policyTypes-də hər ikisi göstərilib, ingress/egress qaydaları isə boşdur
+# → heç nəyə icazə verilmir.
+#
+# Egress-in də bağlanması qəsdəndir və çox vacibdir: əksər nümunələr yalnız
+# ingress-i bağlayır. Halbuki data exfiltration, reverse shell və C2
+# əlaqəsi EGRESS-dir. Ingress bağlamaq hücumçunun içəri girməsini
+# çətinləşdirir; egress bağlamaq isə içəri girdikdən sonra data çıxarmasının
+# qarşısını alır.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: capstone
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. DNS EGRESS — ad həlli üçün
+#
+# Default deny-dən sonra DNS-i açmaq MƏCBURİDİR. Əks halda pod heç bir adı
+# həll edə bilmir və hətta öz health probe-ları belə qəribə şəkildə uğursuz olur.
+# Bu, default-deny tətbiq edərkən ən çox rast gəlinən nasazlıq səbəbidir.
+#
+# İcazə YALNIZ kube-system namespace-indəki CoreDNS pod-larına və yalnız
+# 53 portuna verilir — "bütün UDP-yə icazə" deyil.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: capstone
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: capstone-app
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. INGRESS CONTROLLER-DƏN GİRİŞ
+#
+# Tətbiqə YALNIZ ingress controller müraciət edə bilər — namespace-dəki
+# digər pod-lar və ya başqa namespace-lər YOX.
+#
+# Bu, "lateral movement" ssenarisinə birbaşa cavabdır: cluster-də başqa bir
+# tətbiq kompromis olsa, o, bizim pod-a şəbəkə üzərindən çata bilməz.
+#
+# ⚠ `kubernetes.io/metadata.name` etiketi Kubernetes tərəfindən avtomatik
+#   qoyulur (v1.21+), ona görə əlavə etiketləmə lazım deyil.
+#   Ingress controller başqa namespace-dədirsə, aşağıdakı adı dəyişin.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-from-controller
+  namespace: capstone
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: capstone-app
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 3000
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. DAST SCANNER ÜÇÜN GİRİŞ (Phase 7)
+#
+# OWASP ZAP canlı tətbiqə qarşı işləyəcək. Skaner cluster daxilində
+# ayrıca namespace-dən işləyir və ona məhdud giriş verilir.
+#
+# Bu policy AYRICA fayl deyil, eyni yerdə saxlanılır ki, "kimə giriş var"
+# sualının cavabı tək yerdə görünsün. Phase 7-də `capstone-dast` namespace-i
+# yaradılacaq.
+#
+# ⚠ Bu policy PRODUCTION-da OLMAMALIDIR. Capstone lab mühiti üçündür.
+#   Kommentariya deyil, açıq etiketlə işarələnib ki, təsadüfən qalmasın.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dast-scanner
+  namespace: capstone
+  labels:
+    capstone.io/environment: lab-only
+  annotations:
+    capstone.io/warning: >-
+      Bu policy yalniz capstone lab muhiti ucundur (Phase 7 DAST).
+      Production-a kocurulmemelidir.
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: capstone-app
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: capstone-dast
+      ports:
+        - protocol: TCP
+          port: 3000

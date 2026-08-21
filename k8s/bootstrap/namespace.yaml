@@ -1,0 +1,47 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# NAMESPACE + POD SECURITY STANDARDS
+#
+# NİYƏ PSS NAMESPACE SƏVİYYƏSİNDƏ:
+#   Deployment-dəki `securityContext` sahələri tətbiqin ÖZ bəyanatıdır —
+#   yəni onları yazan da, silən də eyni komandadır. Kimsə təsadüfən
+#   `runAsNonRoot: true` sətrini silsə, manifest yenə də etibarlıdır və
+#   Kubernetes onu qəbul edir.
+#
+#   PSS isə ADMISSION səviyyəsində işləyir: namespace-ə "restricted" etiketi
+#   vurulubsa, API server hardened OLMAYAN pod-u ÜMUMİYYƏTLƏ QƏBUL ETMİR.
+#   Bu, "manifest düzgün yazılıb" ümidindən "yanlış manifest fiziki olaraq
+#   deploy edilə bilməz" təminatına keçiddir.
+#
+#   Yəni iki müstəqil qat:
+#     1. Gate 4 (Trivy config, CI) → merge-dən əvvəl tutur
+#     2. PSS (admission, cluster)  → merge-dən sonra da tutur
+#   Birincisi bypass edilə bilər (məs. kimsə əl ilə kubectl apply edir),
+#   ikincisi edilə bilməz.
+#
+# `restricted` səviyyəsi tələb edir:
+#   runAsNonRoot, allowPrivilegeEscalation: false, capabilities.drop: ALL,
+#   seccompProfile: RuntimeDefault, hostPath/hostNetwork/hostPID qadağan,
+#   yalnız təhlükəsiz volume tipləri.
+#
+# Üç rejim eyni anda təyin olunur:
+#   enforce → pozan pod REDD EDİLİR
+#   audit   → audit log-a yazılır (nəyin pozulduğunu görmək üçün)
+#   warn    → kubectl istifadəçisinə xəbərdarlıq göstərilir
+# Yalnız `enforce` yazmaq səhvdir: pozuntu baş verəndə developer səbəbi
+# görmür. audit+warn diaqnostika verir.
+# ═════════════════════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: capstone
+  labels:
+    app.kubernetes.io/name: secure-cicd-capstone
+    app.kubernetes.io/managed-by: github-actions
+
+    # Pod Security Standards — ən sərt səviyyə.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest

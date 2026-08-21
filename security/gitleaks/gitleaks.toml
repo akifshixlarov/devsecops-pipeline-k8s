@@ -1,0 +1,140 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Gitleaks konfiqurasiyası — Secret Lifecycle Gate 1 (pre-commit) VƏ
+# Gate 2 (CI/PR) tərəfindən PAYLAŞILIR.
+#
+# Tək konfiqurasiya olması qəsdəndir: lokal hook və CI eyni qaydaları tətbiq
+# etməlidir, əks halda developer lokal olaraq "təmiz" görünüb CI-da qırmızı
+# alır (və ya daha pisi — əksinə).
+#
+# `extend.useDefault = true` → Gitleaks-in daxili qaydaları (AWS, GCP, Azure,
+# GitHub PAT, Slack, Stripe, private key və s.) aktiv qalır. Biz onları ƏVƏZ
+# ETMİRİK, yalnız layihəyə spesifik qaydalar və dar allowlist əlavə edirik.
+#
+# ⚠ RE2 MƏHDUDİYYƏTİ (real testdə aşkarlanmış baq):
+#   Gitleaks Go-nun RE2 mühərrikindən istifadə edir. RE2 negative lookahead
+#   `(?!...)` DƏSTƏKLƏMİR — belə regex gitleaks-i panic ilə çökdürür və
+#   nəticədə BÜTÜN secret scan sıradan çıxır (həm hook, həm CI job-u).
+#   Bu faylda lookahead istifadə edilmir; inkar şərtləri character class və
+#   allowlist ilə ifadə olunur.
+#
+# ALLOWLIST FƏLSƏFƏSİ:
+#   Allowlist mümkün qədər DAR olmalıdır. Geniş allowlist secret detection-ı
+#   səssizcə söndürür. Hər istisna üçün SƏBƏB yazılıb — səbəbsiz istisna
+#   code review-də rədd edilməlidir.
+# ─────────────────────────────────────────────────────────────────────────────
+
+title = "Secure CI/CD Capstone — Gitleaks Config"
+
+[extend]
+useDefault = true
+
+# ═══ Layihəyə spesifik qaydalar ═════════════════════════════════════════════
+
+[[rules]]
+id = "capstone-defectdojo-api-key"
+description = "DefectDojo API acari"
+regex = '''(?i)(dd[_-]?api[_-]?key|defectdojo[_-]?token)\s*[:=]\s*['"]?([a-f0-9]{40})['"]?'''
+secretGroup = 2
+tags = ["defectdojo", "api-key", "capstone"]
+
+[[rules]]
+id = "capstone-kubeconfig-token"
+description = "Kubernetes ServiceAccount token ve ya kubeconfig credential"
+regex = '''(?i)(client-key-data|client-certificate-data)\s*:\s*[A-Za-z0-9+/=]{40,}'''
+tags = ["kubernetes", "credential", "capstone"]
+
+[[rules]]
+id = "capstone-generic-env-secret"
+description = "Deyisen adi secret-benzer olan hardcoded literal deyer"
+#
+# Bu regex uc real baqdan sonra formalasib:
+#
+#  1. Negative lookahead `(?!...)` SILINDI — RE2 onu desteklemir ve gitleaks
+#     panic edirdi. "Deyer $ ile baslamasin" serti indi inkar edilmis
+#     character class ile ifade olunur: [^\s"'#$<>{}]
+#
+#  2. `^` ankeri SILINDI — RE2-de `^` metnin basidir (setrin yox), ona gore
+#     `const API_KEY = "..."` kimi setirler hec vaxt uygunlasmirdi.
+#
+#  3. Acar sozun HEM EVVELINDE, HEM SONRASINDA [A-Za-z0-9_]* var — eks halda
+#     `AWS_SECRET_ACCESS_KEY` uygunlasmirdi, cunki "SECRET"-den sonra
+#     "_ACCESS_KEY" gelir.
+#
+regex = '''(?i)[A-Za-z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|APIKEY|API_KEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIAL)[A-Za-z0-9_]*\s*[:=]\s*["']?([^\s"'#$<>{}][^\s"'#<>{}]{11,})'''
+secretGroup = 1
+# Entropy esigi: `PASSWORD = changeme` kimi asagi entropiyali placeholder-leri
+# buraxir, real random deyerleri tutur.
+entropy = 3.5
+tags = ["env", "generic", "capstone"]
+
+# ── Qayda seviyyesinde allowlist ────────────────────────────────────────────
+# REAL TESTDE ASKARLANMIS KRITIK FALSE POSITIVE:
+#     const DATABASE_PASSWORD = process.env.DATABASE_PASSWORD;
+# yeni mehz DUZGUN, tovsiye etdiyimiz kod secret kimi flag olunurdu.
+#
+# Bu, security gate-in en tehlukeli nasazliq novudur: developer-i duzgun
+# davranisa gore cezalandirir. Netice her zaman eynidir — komanda gate-i
+# tamamile sondurur ve real secret-ler de kecir.
+#
+# Asagidaki pattern-ler deyerin LITERAL secret deyil, ISTINAD oldugunu gosterir.
+[[rules.allowlists]]
+description = "Environment / secret-manager istinadlari - literal secret deyil"
+regexTarget = "line"
+regexes = [
+  '''process\.env''',
+  '''os\.environ''',
+  '''System\.getenv''',
+  '''getenv\(''',
+  '''ENV\[''',
+  '''secretKeyRef''',
+  '''valueFrom''',
+  '''\$\{''',
+  '''\$\(''',
+  '''<%=''',
+  '''config\.get\(''',
+  '''vault:''',
+  '''fromEnv''',
+  '''secrets\.''',
+]
+
+# ═══ Qlobal allowlist ═══════════════════════════════════════════════════════
+
+[[allowlists]]
+description = """
+Senedlesdirme ve numune fayllari.
+SEBEB: .env.example qesden real deyer saxlamir (Phase 1-de bele dizayn edilib);
+docs/ ise threat model senedidir. Bunlar deploy edilen artefakt deyil.
+DIQQET: yalniz `.example` sekilcili fayl istisna olunur — `.env` OZU ISTISNA DEYIL.
+"""
+paths = [
+  '''\.env\.example$''',
+  '''^docs/.*\.md$''',
+]
+
+[[allowlists]]
+description = """
+Bile-bile istifade olunan dummy/test deyerleri.
+SEBEB: capstone RED testleri ucun qesden yaradilmis saxta secret-ler real
+credential deyil ve rotasiya teleb etmir. Bu istisna OLMASA her RED test
+qacilmaz olaraq Gate 1 ve Gate 2-ni bloklayardi.
+"""
+regexes = [
+  '''(?i)DUMMY-NOT-A-REAL-SECRET''',
+  '''(?i)dummy[_-]?(value|secret|token|key)''',
+  '''(?i)REPLACE[_-]ME''',
+  '''(?i)EXAMPLE_?KEY''',
+  '''(?i)changeme''',
+]
+
+[[allowlists]]
+description = """
+package-lock.json icindeki integrity hash-leri.
+SEBEB: npm `sha512-...` integrity deyerleri yuksek entropiyaya malikdir ve
+generic qaydalari yanlis tetikleyir. Bunlar public checksum-lardir, secret deyil.
+Yalniz `integrity` sahesi istisna olunur — faylin qalani skan olunur.
+"""
+regexes = [
+  '''"integrity":\s*"sha(256|512)-[A-Za-z0-9+/=]+"''',
+  '''"resolved":\s*"https://registry\.npmjs\.org/''',
+]
+paths = ['''package-lock\.json$''']

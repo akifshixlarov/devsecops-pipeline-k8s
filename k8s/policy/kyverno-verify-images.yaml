@@ -1,0 +1,154 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# KYVERNO — ADMISSION-LEVEL IMAGE VERIFICATION
+#
+# ⚠ BU FAYL ŞABLONDUR. Birbaşa `kubectl apply` ETMƏYİN.
+#   Placeholder-lər `ci/render-kyverno-policy.sh` tərəfindən
+#   `security/cosign/trust-policy.env`-dən doldurulur.
+#   Səbəb: imzalayan kimlik YEGANƏ yerdə saxlanılmalıdır — CI doğrulaması,
+#   lokal audit və admission policy eyni dəyərləri istifadə etməlidir.
+#   İki yerdə ayrıca yazılsaydı, biri yenilənib digəri unudula bilərdi.
+#
+# NİYƏ KYVERNO (Ratify/Azure Policy əvəzinə):
+#   Ratify AKS-də Azure-native seçimdir, lakin əlavə komponentlər (Ratify
+#   provider + Gatekeeper + Azure Policy add-on) tələb edir və capstone
+#   miqyasında konfiqurasiya səthini əhəmiyyətli artırır. Kyverno tək
+#   Helm chart-dır, keyless doğrulamanı native dəstəkləyir və policy YAML-ı
+#   birbaşa oxunaqlıdır. Enterprise-da hər ikisi keçərlidir; seçim
+#   komandanın mövcud alət dəstinə görə edilməlidir.
+#
+# NİYƏ ADMISSION SƏVİYYƏSİ LAZIMDIR:
+#   Phase 4-də CI imzanı yoxlayır (Gate 7B). Lakin bu, YALNIZ pipeline-dan
+#   keçən deploy-ları qoruyur. Kim isə əl ilə `kubectl apply` etsə,
+#   pipeline tamamilə bypass olunur.
+#   Admission controller isə API server səviyyəsindədir — HEÇ BİR yol onu
+#   yan keçə bilmir. Bu, "pipeline nizam-intizamı"ndan "texniki təminat"a keçiddir.
+#
+# Threat model: T5 — imzalanmamış/dəyişdirilmiş image deploy olunur (High).
+#
+# ⚠ YAML QEYDI (real testdə aşkarlanmış baq):
+#   `subject` dəyəri regexp-dir və `\.` kimi escape-lər saxlayır.
+#   YAML-da CÜT dırnaq içində `\.` ETİBARSIZ escape sayılır və parser
+#   xəta verir: "found unknown escape character '.'"
+#   Ona görə bu üç sahə TƏK dırnaqdadır — YAML-da tək dırnaq içində
+#   backslash literal simvoldur və heç bir şəkildə interpretasiya olunmur.
+# ═════════════════════════════════════════════════════════════════════════════
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-capstone-image-signature
+  annotations:
+    policies.kyverno.io/title: Verify Cosign keyless signature
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: critical
+    policies.kyverno.io/description: >-
+      capstone namespace-inde islenen butun image-ler bizim GitHub Actions
+      workflow-umuz terefinden keyless imzalanmiş olmalidir. Imzasiz ve ya
+      başqa kimlik terefinden imzalanmiş image ADMISSION seviyyesinde
+      REDD EDILIR.
+spec:
+  # ⚠ Enforce — Audit DEYİL.
+  # Audit rejimində policy yalnız hesabat verir və pod yenə də işə düşür.
+  # Bu, "policy var" görünüşü yaradır, əslində isə heç nə bloklamır.
+  validationFailureAction: Enforce
+
+  # Mövcud pod-lar üçün fon skanı: policy tətbiq edilməzdən əvvəl
+  # deploy olunmuş uyğunsuz iş yükləri də aşkarlanır.
+  background: true
+
+  # Webhook əlçatmaz olarsa admission UĞURSUZ olsun (fail-closed).
+  # `Ignore` seçilsəydi, Kyverno-nu sıradan çıxarmaq policy-ni tamamilə
+  # söndürmək üçün kifayət edərdi.
+  failurePolicy: Fail
+
+  webhookTimeoutSeconds: 30
+
+  rules:
+    - name: verify-signature-keyless
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - capstone
+      verifyImages:
+        # Yalnız bizim ACR-dən gələn capstone image-lərinə tətbiq olunur.
+        # Digər image-lər (məs. ingress controller) bu qaydadan kənardır və
+        # onlar üçün ayrıca policy yazılmalıdır.
+        - imageReferences:
+            - '__ACR_LOGIN_SERVER__/capstone/app*'
+
+          # İmza tapılmasa və ya doğrulanmasa → pod REDD EDİLİR.
+          mutateDigest: true      # tag verilsə belə digest-ə çevirir
+          verifyDigest: true
+          required: true
+
+          attestors:
+            - count: 1
+              entries:
+                - keyless:
+                    # ⚠ Bu iki dəyər trust-policy.env-dən gəlir.
+                    # `subject` regexp-dir və QƏSDƏN DARDIR: yalnız bizim
+                    # repo-nun bizim workflow-u, yalnız main branch-dən.
+                    #
+                    # Geniş dəyər (məs. "*") yazmaq doğrulamanı MƏNASIZLAŞDIRIR:
+                    # Sigstore public instance-dır, istənilən şəxs istənilən
+                    # image-i imzalaya bilər.
+                    subject: '__CERT_IDENTITY_REGEXP__'
+                    issuer: '__CERT_OIDC_ISSUER__'
+
+                    rekor:
+                      url: https://rekor.sigstore.dev
+                      # İmzanın transparency log-da olması MƏCBURİDİR.
+                      # Bu, "gizli imzalama" ssenarisinin qarşısını alır:
+                      # hər imza public log-a yazılır və sonradan audit edilə bilir.
+                      ignoreTlog: false
+
+---
+# ═════════════════════════════════════════════════════════════════════════════
+# SBOM ATTESTATION TƏLƏBİ
+#
+# İmza "bu artefakt bizimdir" deyir. Attestation isə "bu artefakt haqqında
+# nə bilirik" deyir. Hər ikisi lazımdır.
+#
+# Bu qayda image-in imzalanmış CycloneDX SBOM-una malik olmasını tələb edir.
+# Nəticə: SBOM-suz image deploy edilə bilmir → "bu konteynerdə nə var?"
+# sualı hər zaman cavablandırıla bilir (incident response üçün kritik).
+# ═════════════════════════════════════════════════════════════════════════════
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-capstone-sbom-attestation
+  annotations:
+    policies.kyverno.io/title: Require signed SBOM attestation
+    policies.kyverno.io/category: Supply Chain Security
+    policies.kyverno.io/severity: high
+spec:
+  validationFailureAction: Enforce
+  background: false
+  failurePolicy: Fail
+  webhookTimeoutSeconds: 30
+  rules:
+    - name: require-sbom-attestation
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - capstone
+      verifyImages:
+        - imageReferences:
+            - '__ACR_LOGIN_SERVER__/capstone/app*'
+          required: true
+          attestations:
+            - type: https://cyclonedx.org/bom
+              attestors:
+                - count: 1
+                  entries:
+                    - keyless:
+                        subject: '__CERT_IDENTITY_REGEXP__'
+                        issuer: '__CERT_OIDC_ISSUER__'
+                        rekor:
+                          url: https://rekor.sigstore.dev
+                          ignoreTlog: false

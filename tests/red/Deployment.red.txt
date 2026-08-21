@@ -1,0 +1,33 @@
+# RED TEST — Gate 4 (IaC) ve Pod Security Standards ucun qesden zeif manifest.
+# .txt sekilcisi ile saxlanilir ki, tesaduefen apply edilmesin.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: insecure-app
+  namespace: capstone
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: insecure}
+  template:
+    metadata:
+      labels: {app: insecure}
+    spec:
+      hostNetwork: true          # PSS restricted pozuntusu
+      hostPID: true              # PSS restricted pozuntusu
+      containers:
+        - name: app
+          image: nginx:latest    # mutable tag
+          securityContext:
+            privileged: true                 # kritik
+            runAsUser: 0                     # root
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false
+            capabilities:
+              add: ["SYS_ADMIN", "NET_ADMIN"]
+          volumeMounts:
+            - name: hostroot
+              mountPath: /host
+      volumes:
+        - name: hostroot
+          hostPath: {path: /}    # host fayl sistemine tam cixiş

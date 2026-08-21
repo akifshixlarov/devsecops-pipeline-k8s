@@ -1,0 +1,63 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Hadolint konfiqurasiyası — Gate 6A (Dockerfile security lint)
+#
+# NİYƏ OVERRIDE LAZIMDIR (real testdə aşkarlanmış boşluq):
+#   Hadolint default olaraq DL3002-ni ("son USER root olmamalıdır") yalnız
+#   `warning` səviyyəsində verir. Bizim severity map-də warning → medium,
+#   policy.yaml-da isə medium → warn (max 10). Nəticə: `USER root` yazan
+#   Dockerfile gate-dən KEÇİRDİ.
+#
+#   Yəni threat model-dəki T3 (root container, High risk, score 6) üçün
+#   qurduğumuz gate əslində bloklamırdı. Aşağıdakı override bunu düzəldir.
+#
+# PRİNSİP: hadolint-in linter prioritetləri ilə bizim threat model-imizin
+# prioritetləri EYNİ DEYİL. Konfiqurasiya bu fərqi bağlayır.
+# ─────────────────────────────────────────────────────────────────────────────
+
+failure-threshold: info   # Hər şeyi report et; qərarı severity_gate.py verir.
+
+override:
+  # ── error səviyyəsinə QALDIRILANLAR (policy: high → BLOCK) ───────────────
+  error:
+    # Konteyner root kimi işləyir. Threat model T3 (High, score 6).
+    # Container escape halında hücumçu birbaşa root imtiyazı əldə edir.
+    - DL3002
+
+    # `latest` tag və ya tag ümumiyyətlə yoxdur → build reproducible deyil,
+    # base image səssizcə dəyişə bilər (supply-chain riski, T5-ə bağlıdır).
+    - DL3006
+    - DL3007
+
+    # ADD ilə uzaq URL-dən fayl çəkmək: checksum yoxlanışı yoxdur, MITM və
+    # kompromis mənbə riski. Əvəzinə COPY + verify edilmiş artefakt.
+    - DL3020
+
+    # `curl | sh` naxışı — icra ediləcək kod build zamanı yoxlanmır.
+    - DL4006
+
+    # sudo istifadəsi — konteynerdə imtiyaz eskalasiyası vektoru.
+    - DL3004
+
+    # Rəqəmsal olmayan UID. Kubernetes `runAsNonRoot: true` yoxlaması
+    # simvolik adı doğrulaya bilmir → pod CreateContainerConfigError verir.
+    # Bu qayda Phase 1 Dockerfile-ında REAL problem tapdı.
+    - DL3066
+
+  # ── info səviyyəsinə ENDİRİLƏNLƏR (policy: low → warn) ───────────────────
+  info:
+    # `apt-get install` üçün versiya pinləməsi. Bizim runtime image
+    # distroless-dir və heç bir paket meneceri saxlamır; builder mərhələsində
+    # isə yalnız rəsmi node image istifadə olunur. Bu qaydanı block etmək
+    # gate-i faydasız şəkildə qırmızı saxlayardı.
+    - DL3008
+    - DL3009
+    - DL3015
+
+# Etibarlı base image registry-ləri.
+# `docker.io` (rəsmi node image) və `gcr.io` (distroless) icazəlidir.
+# ACR də əlavə olunub — gələcəkdə base image-ləri öz registry-mizə
+# mirror etsək (air-gap / supply-chain sərtləşdirmə) hazır olsun.
+trustedRegistries:
+  - docker.io
+  - gcr.io
+  - "*.azurecr.io"

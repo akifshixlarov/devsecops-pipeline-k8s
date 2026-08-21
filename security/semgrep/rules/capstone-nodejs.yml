@@ -1,0 +1,164 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Layihəyə spesifik Semgrep qaydaları.
+#
+# Bunlar `p/security-audit`, `p/javascript`, `p/owasp-top-ten` registry
+# ruleset-lərinə ƏLAVƏDİR — onları əvəz etmir.
+#
+# Buradakı qaydalar bizim threat model-dəki konkret control-ları qoruyur:
+# yəni "Phase 1-də qurduğumuz müdafiə təsadüfən sökülsə, SAST bunu tutsun".
+# Bu, generic ruleset-lərin tutmadığı reqressiyalardır.
+# ─────────────────────────────────────────────────────────────────────────────
+rules:
+
+  - id: capstone-hardcoded-secret-assignment
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      impact: HIGH
+      confidence: MEDIUM
+      category: security
+      cwe: 'CWE-798: Use of Hard-coded Credentials'
+      threat-model-ref: 'T1 — hardcoded secret (Critical, score 9)'
+    message: >-
+      Hardcoded credential aşkarlandı. Secret dəyəri koda yazılmamalıdır —
+      environment variable və ya Kubernetes Secret istifadə edin.
+      Bu, threat model T1 riskidir və git history-də immutable qalır.
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $KEY = "..."
+          - pattern: |
+              { ..., $KEY: "...", ... }
+      - metavariable-regex:
+          metavariable: $KEY
+          # Secret-bənzər adları tutur, LAKİN `tokenName`, `apiKeyHeader`,
+          # `secretType` kimi metadata sahələrini istisna edir (false positive azaldılması).
+          regex: (?i)^(?!.*(name|type|header|field|label|param|path|url)$).*(passwd|password|secret|api_?key|apikey|token|credential|private_?key).*$
+      # Boş string və konkatenasiya (adətən env oxuması) false positive-dir.
+      - pattern-not: $KEY = ""
+      - pattern-not: $KEY = "..." + $X
+
+  - id: capstone-express-error-handler-leaks-stack
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      impact: HIGH
+      confidence: HIGH
+      category: security
+      cwe: 'CWE-209: Generation of Error Message Containing Sensitive Information'
+      threat-model-ref: 'STRIDE-I — Information Disclosure (§ 3.8)'
+    message: >-
+      Error handler daxili error detalını (stack/message) client-ə göndərir.
+      Phase 1-də qurulan generic error handler pozulub — bu, daxili fayl
+      yollarını və kitabxana versiyalarını attacker-ə ifşa edir.
+    # DİQQƏT — bu qayda qəsdən DAR saxlanılıb.
+    # İlk versiyada `$RES.json({..., error: $ERR, ...})` pattern-i var idi və o,
+    # Phase 1-in TAM TƏHLÜKƏSİZ `res.status(404).json({error:'not_found'})`
+    # cavablarını da tuturdu (7 false positive). Semgrep-də `$ERR` istənilən
+    # ifadəni, o cümlədən string literal-ı tutur.
+    # Dərs: SAST qaydası false positive verəndə komanda gate-i söndürür —
+    # ona görə qayda dəqiqliyi gate-in sağ qalması üçün security control-dur.
+    # İndi yalnız error OBYEKTİNİN sahələrinin ötürülməsi flag olunur.
+    patterns:
+      - pattern-either:
+          - pattern: '$RES.status(...).json({..., stack: $ERR.stack, ...})'
+          - pattern: '$RES.status(...).json({..., message: $ERR.message, ...})'
+          - pattern: '$RES.json({..., stack: $ERR.stack, ...})'
+          - pattern: '$RES.json({..., message: $ERR.message, ...})'
+          - pattern: $RES.status(...).send($ERR.stack)
+          - pattern: $RES.send($ERR.stack)
+          - pattern: '$RES.json({..., error: $ERR.message, ...})'
+          - pattern: $RES.json($ERR)
+      # `catch (err)` blokundan kənarda təsadüfi uyğunluqları azaltmaq üçün
+      # metavariable adı error-bənzər olmalıdır.
+      - metavariable-regex:
+          metavariable: $ERR
+          regex: (?i)^(err|error|e|ex|exception)$
+
+  - id: capstone-helmet-disabled
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      impact: HIGH
+      confidence: HIGH
+      category: security
+      threat-model-ref: 'T10 — DAST-la aşkarlanan header zəiflikləri'
+    message: >-
+      Helmet-in təhlükəsizlik başlıqları söndürülüb. contentSecurityPolicy və ya
+      hsts söndürülməsi clickjacking/XSS müdafiəsini zəiflədir və Gate 9 (DAST)
+      mərhələsində finding yaradacaq.
+    patterns:
+      - pattern-either:
+          - pattern: 'helmet({..., contentSecurityPolicy: false, ...})'
+          - pattern: 'helmet({..., hsts: false, ...})'
+          - pattern: 'helmet({..., frameguard: false, ...})'
+          - pattern: 'helmet({..., noSniff: false, ...})'
+
+  - id: capstone-cors-wildcard-origin
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      impact: HIGH
+      confidence: HIGH
+      category: security
+      cwe: 'CWE-942: Permissive Cross-domain Policy'
+      threat-model-ref: 'STRIDE-T — Tampering (§ 3.8)'
+    message: >-
+      CORS bütün origin-lərə açılıb. Phase 1-dəki deny-by-default siyasəti
+      pozulub. Konkret origin-i CORS_ORIGIN environment variable ilə təyin edin.
+    patterns:
+      - pattern-either:
+          - pattern: 'cors({..., origin: "*", ...})'
+          - pattern: 'cors({..., origin: true, ...})'
+
+  - id: capstone-child-process-with-user-input
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      impact: HIGH
+      confidence: MEDIUM
+      category: security
+      cwe: 'CWE-78: OS Command Injection'
+    message: >-
+      Request məlumatı shell əmrinə ötürülür — command injection riski.
+      exec/execSync əvəzinə execFile istifadə edin və inputu allowlist ilə validasiya edin.
+    patterns:
+      - pattern-either:
+          - pattern: $CP.exec(<... $REQ.body ...>, ...)
+          - pattern: $CP.exec(<... $REQ.query ...>, ...)
+          - pattern: $CP.exec(<... $REQ.params ...>, ...)
+          - pattern: $CP.execSync(<... $REQ.body ...>, ...)
+          - pattern: $CP.execSync(<... $REQ.query ...>, ...)
+          - pattern: $CP.execSync(<... $REQ.params ...>, ...)
+
+  - id: capstone-eval-like-construct
+    languages: [javascript, typescript]
+    severity: ERROR
+    metadata:
+      impact: HIGH
+      confidence: HIGH
+      category: security
+      cwe: 'CWE-95: Eval Injection'
+    message: >-
+      eval / new Function / setTimeout(string) istifadə olunur — arbitrary code
+      execution riski. Bu konstruksiyalara bu layihədə ehtiyac yoxdur.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+      - pattern: setTimeout("...", ...)
+      - pattern: setInterval("...", ...)
+
+  - id: capstone-rate-limit-removed
+    languages: [javascript, typescript]
+    severity: WARNING
+    metadata:
+      impact: MEDIUM
+      confidence: LOW
+      category: security
+      threat-model-ref: 'STRIDE-D — Denial of Service (§ 3.9)'
+    message: >-
+      express.json() body limit-siz istifadə olunur. Limitsiz payload resurs
+      tükənməsinə (DoS) yol açır. Phase 1-də limit '10kb' idi.
+    patterns:
+      - pattern: express.json()
+      - pattern-not: 'express.json({..., limit: ..., ...})'

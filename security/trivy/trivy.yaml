@@ -1,0 +1,39 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Trivy konfiqurasiyası.
+# Workflow-da `--config security/trivy/trivy.yaml` ilə istifadə olunur.
+# Məqsəd: scan davranışını YAML-da deyil, versiya nəzarətindəki faylda saxlamaq
+# (dəyişiklik audit edilə bilsin).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Severity filtri BURADA tətbiq EDİLMİR — Trivy hər şeyi report edir,
+# qərarı isə ci/severity_gate.py verir. Səbəb: DefectDojo bütün severity-ləri
+# görməlidir (Low/Medium trend analizi üçün), gate isə yalnız policy tətbiq edir.
+severity:
+  - UNKNOWN
+  - LOW
+  - MEDIUM
+  - HIGH
+  - CRITICAL
+
+# Düzəlişi olmayan CVE-lər gate-i bloklamasın (bax policy.yaml şərhi),
+# lakin report-da qalsın deyə bu, yalnız `trivy fs` çağırışında CLI flag kimi verilir.
+ignore-unfixed: false
+
+# Scan zamanı skip ediləcək yollar.
+# DAR saxlanılır: yalnız artefakt/cache qovluqları.
+scan:
+  skip-dirs:
+    - node_modules/.cache
+    - .git
+    - reports
+  skip-files:
+    - app/package-lock.json.bak
+
+# Misconfiguration scan üçün.
+misconfiguration:
+  # Dockerfile və Kubernetes üçün daxili policy-lər (AVD/KSV qaydaları) aktivdir.
+  include-non-failures: false
+
+db:
+  # Vulnerability DB-nin köhnəlməsinə icazə vermə: köhnə DB = tapılmayan CVE.
+  skip-update: false

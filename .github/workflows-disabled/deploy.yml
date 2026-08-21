@@ -1,0 +1,210 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# PHASE 5 — GATE 8: DEPLOY TO AKS
+#
+#   build.yml (imzalanmış + kilidlənmiş digest)
+#        ↓ workflow_run
+#   imza doğrulaması → digest tətbiqi → server-side dry-run (PSS + Kyverno)
+#        ↓
+#   apply → rollout → deploy sonrası doğrulama → evidence
+#
+# NİYƏ `workflow_run` (build.yml-ə əlavə etmək əvəzinə):
+#   Deploy ayrı mühit (production environment) və ayrı icazə dəsti tələb edir.
+#   Ayrı workflow onları izolə edir və `environment: production` qorunmasını
+#   deploy-a şamil edir. Həmçinin deploy-u əl ilə yenidən işə salmaq
+#   (workflow_dispatch) mümkün olur — build-i təkrarlamadan.
+#
+# ⚠ `workflow_run` TƏHLÜKƏSİZLİK QEYDİ:
+#   Bu trigger workflow-u DEFAULT BRANCH kontekstində işlədir və secret-lərə
+#   çıxış verir. Fork PR kodunun buraya düşməməsi üçün job-lar açıq şəkildə
+#   yoxlayır ki, tetikləyən workflow `main`-də UĞURLA bitib.
+# ═════════════════════════════════════════════════════════════════════════════
+name: Deploy to AKS
+
+on:
+  workflow_run:
+    workflows: ["Build & Image Security"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_digest:
+        description: 'Image digest (sha256:...) — əl ilə deploy üçün'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  # Deploy-lar SIRA İLƏ getməlidir — cancel-in-progress: false.
+  # Paralel deploy yarım qalmış rollout üzərinə yeni rollout yazar və
+  # cluster vəziyyəti gözlənilməz olar.
+  group: deploy-aks-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: '3.12'
+  NAMESPACE: capstone
+  IMAGE_REPO: capstone/app
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ÖN ŞƏRT — build workflow-u uğurlu bitibmi
+  #
+  # `workflow_run` tetikləyici workflow UĞURSUZ olduqda da işə düşür.
+  # Bu yoxlama olmadan uğursuz build-dən sonra deploy cəhdi edilərdi.
+  # ═══════════════════════════════════════════════════════════════════════════
+  precheck:
+    name: 'Ön şərt — build nəticəsi'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      image_digest: ${{ steps.resolve.outputs.image_digest }}
+    steps:
+      - name: Resolve image digest
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          MANUAL_DIGEST: ${{ inputs.image_digest }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${MANUAL_DIGEST:-}" ]; then
+            DIGEST="${MANUAL_DIGEST}"
+            echo "Əl ilə göstərilən digest istifadə olunur."
+          else
+            # Digest build workflow-unun artifact-ından oxunur.
+            # Bu, digest-i yenidən "hesablamaq" cəhdindən daha etibarlıdır:
+            # artefakt build run-ına birmənalı bağlıdır.
+            echo "Build run ${RUN_ID} artifact-larından digest oxunur…"
+            gh run download "${RUN_ID}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --name gate-5-build-metadata \
+              --dir /tmp/meta 2>/dev/null \
+              || { echo "::error::build metadata artifact-ı tapılmadı"; exit 1; }
+
+            DIGEST="$(python3 -c "
+            import json
+            m = json.load(open('/tmp/meta/build-metadata.json'))
+            print(m['containerimage.digest'])
+            ")"
+          fi
+
+          case "${DIGEST}" in
+            sha256:*) ;;
+            *) echo "::error::Yanlış digest formatı: ${DIGEST}"; exit 1 ;;
+          esac
+
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Digest: ${DIGEST}"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # GATE 8 — DEPLOY
+  # ═══════════════════════════════════════════════════════════════════════════
+  gate-8-deploy:
+    name: 'Gate 8 — Deploy to AKS'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    needs: precheck
+    permissions:
+      contents: read
+      id-token: write     # Azure OIDC
+    environment: production
+    outputs:
+      image_ref: ${{ steps.deploy.outputs.image_ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Cosign (pinned + checksum verified)
+        run: bash ci/install-scanners.sh cosign
+
+      - name: Azure login (OIDC, keyless)
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: bash ci/azure-login.sh
+
+      - name: ACR login (imza doğrulaması üçün)
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+        run: az acr login --name "${ACR_NAME}" --output none
+
+      - name: AKS login (keyless, kubeconfig secret yoxdur)
+        env:
+          AKS_RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
+          AKS_CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+          NAMESPACE: ${{ env.NAMESPACE }}
+        run: bash ci/aks-login.sh
+
+      - name: Deploy
+        id: deploy
+        env:
+          ACR_NAME: ${{ secrets.ACR_NAME }}
+          DIGEST: ${{ needs.precheck.outputs.image_digest }}
+          NAMESPACE: ${{ env.NAMESPACE }}
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${ACR_NAME}.azurecr.io/${IMAGE_REPO}@${DIGEST}"
+          echo "image_ref=${IMAGE_REF}" >> "$GITHUB_OUTPUT"
+          IMAGE_REF="${IMAGE_REF}" bash ci/k8s-deploy.sh
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # EVIDENCE — cluster vəziyyətinin sübutu
+  #
+  # Ayrıca job-dur ki, deploy uğursuz olsa belə (`if: always()`) cluster
+  # vəziyyəti sənədləşdirilsin — insident təhlili üçün.
+  # ═══════════════════════════════════════════════════════════════════════════
+  collect-evidence:
+    name: 'Evidence — cluster vəziyyəti'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    needs: [precheck, gate-8-deploy]
+    if: always() && needs.gate-8-deploy.result != 'skipped'
+    permissions:
+      contents: read
+      id-token: write
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Azure login (OIDC, keyless)
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: bash ci/azure-login.sh
+
+      - name: AKS login
+        env:
+          AKS_RESOURCE_GROUP: ${{ secrets.AKS_RESOURCE_GROUP }}
+          AKS_CLUSTER_NAME: ${{ secrets.AKS_CLUSTER_NAME }}
+          NAMESPACE: ${{ env.NAMESPACE }}
+        run: bash ci/aks-login.sh
+
+      - name: Collect hardening evidence
+        env:
+          NAMESPACE: ${{ env.NAMESPACE }}
+        run: bash ci/k8s-evidence.sh
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-8-k8s-evidence
+          path: evidence/
+          retention-days: 90

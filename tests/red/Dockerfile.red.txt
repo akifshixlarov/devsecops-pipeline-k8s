@@ -1,0 +1,10 @@
+# RED TEST — Gate 6A (Hadolint) ucun qesden zeif Dockerfile.
+# .txt sekilcisi ile saxlanilir ki, hec vaxt build edilmesin.
+FROM node:latest
+RUN apt-get update && apt-get install -y curl
+ADD https://example.com/app.tar.gz /app
+COPY . /app
+WORKDIR /app
+RUN npm install
+USER root
+CMD npm start

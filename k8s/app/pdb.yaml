@@ -1,0 +1,23 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# POD DISRUPTION BUDGET
+#
+# Node drain, cluster upgrade və avtomatik miqyaslama zamanı ən azı bir
+# pod-un işlək qalmasını təmin edir.
+#
+# Təhlükəsizlik əlaqəsi: əlçatanlıq (availability) da təhlükəsizlik
+# xassəsidir — STRIDE-in "D" hərfi. Planlı əməliyyat zamanı tətbiqin
+# tamamilə dayanması DoS-un könüllü variantıdır.
+#
+# minAvailable: 1 (maxUnavailable əvəzinə) — replica sayı dəyişsə də
+# ən azı bir işlək pod zəmanəti qalır.
+# ═════════════════════════════════════════════════════════════════════════════
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: capstone-app
+  namespace: capstone
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: capstone-app

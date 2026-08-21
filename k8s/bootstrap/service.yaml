@@ -1,0 +1,28 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# SERVICE
+#
+# Tip ClusterIP-dir — LoadBalancer DEYİL.
+#
+# NİYƏ: LoadBalancer tipi pod-u BİRBAŞA internetə açır və NetworkPolicy,
+# TLS terminasiyası, rate limiting, WAF kimi qatları bypass edir.
+# Xarici giriş Ingress controller vasitəsilə olmalıdır — belə ki, trafik
+# nəzarət edilən tək nöqtədən keçsin (threat model § 3.9).
+#
+# DAST (Phase 7) və xarici çıxış üçün Ingress ayrıca əlavə olunacaq.
+# ═════════════════════════════════════════════════════════════════════════════
+apiVersion: v1
+kind: Service
+metadata:
+  name: capstone-app
+  namespace: capstone
+  labels:
+    app.kubernetes.io/name: capstone-app
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: capstone-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
