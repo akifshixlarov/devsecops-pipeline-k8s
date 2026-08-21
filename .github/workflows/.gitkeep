@@ -1,0 +1,9 @@
+# Bu qovluq qesden boşdur.
+#
+# Workflow-lar ilk push zamani .github/workflows-disabled/ altindadir.
+# Sebeb: repository secret-leri (AZURE_*, ACR_NAME, DD_*) hele
+# konfiqurasiya edilmeyib, ona gore workflow-lar qacilmaz olaraq ugursuz
+# olardi ve tarixcenin BAŞLANGICI qirmizi qalardi.
+#
+# Azure setup ve GitHub Secrets hazir olduqda bir-bir geri qaytarilir:
+#   git mv .github/workflows-disabled/security.yml .github/workflows/
