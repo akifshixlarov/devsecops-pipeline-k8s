@@ -1,4 +1,4 @@
 # Security gate skriptlərinin asılılıqları (ci/*.py).
 # Bunlar scanner DEYİL — scanner versiyaları ci/scanner-versions.env-dədir.
-PyYAML==6.0.2
+PyYAML==6.0.4
 requests==2.32.3
