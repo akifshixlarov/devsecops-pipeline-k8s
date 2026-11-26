@@ -3,6 +3,7 @@
 # Cluster OLMADAN işleyen hisseleri yoxlayir: manifest validliyi, Gate 4
 # (IaC) neticesi, digest mecburiyyeti, trust policy render-i.
 set -Eeuo pipefail
+export PATH="${HOME}/.local/bin:/home/akif/.local/bin:${PATH}"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "${REPO_ROOT}"
 

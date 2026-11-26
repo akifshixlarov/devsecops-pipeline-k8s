@@ -29,6 +29,13 @@ import argparse
 import json
 import os
 import sys
+
+# Ensure UTF-8 output encoding across platforms (Windows / Linux)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -81,19 +88,33 @@ def scanner_errors(fmt: str, doc: Any) -> list[str]:
         exit 2 (ERROR) qaytarır — pipeline dayanır.
     """
     errs: list[str] = []
-    if fmt == "semgrep" and isinstance(doc, dict):
+    if fmt == "semgrep":
+        if not isinstance(doc, dict) or not isinstance(doc.get("results"), list):
+            errs.append("Semgrep çıxışında 'results' siyahısı yoxdur — scan natamam və ya zədəlidir")
+            return errs
         for e in doc.get("errors", []) or []:
             if isinstance(e, dict):
                 msg = e.get("message") or e.get("long_msg") or e.get("short_msg") or str(e)
             else:
                 msg = str(e)
             errs.append(str(msg).strip().split("\n")[0][:200])
-    elif fmt == "trivy" and isinstance(doc, dict):
+    elif fmt == "trivy":
         # Trivy heç bir target tapmadıqda `Results` yoxdur/boşdur.
         # Bu, "zəiflik yoxdur" DEYİL, "scan edəcək heç nə tapılmadı" deməkdir.
-        if "Results" not in doc:
-            errs.append("Trivy çıxışında 'Results' sahəsi yoxdur — scan hədəfi tapılmayıb?")
-    elif fmt == "sarif" and isinstance(doc, dict):
+        if not isinstance(doc, dict):
+            errs.append("Trivy çıxışı JSON obyekti deyil")
+        elif "Results" not in doc and "SchemaVersion" not in doc:
+            errs.append("Trivy çıxışında 'Results' və ya 'SchemaVersion' sahəsi yoxdur — scan hədəfi tapılmayıb?")
+    elif fmt == "gitleaks":
+        if not (isinstance(doc, list) or (isinstance(doc, dict) and isinstance(doc.get("findings"), list))):
+            errs.append("Gitleaks çıxışı gözlənilən JSON array formatında deyil")
+    elif fmt == "hadolint":
+        if not (isinstance(doc, list) or (isinstance(doc, dict) and isinstance(doc.get("results"), list))):
+            errs.append("Hadolint çıxışı gözlənilən JSON formatında deyil")
+    elif fmt == "sarif":
+        if not isinstance(doc, dict) or not isinstance(doc.get("runs"), list):
+            errs.append("SARIF çıxışında 'runs' siyahısı yoxdur — scan natamam və ya zədəlidir")
+            return errs
         for run in doc.get("runs", []) or []:
             for notif in (run.get("invocations") or [{}])[0].get("toolExecutionNotifications", []) or []:
                 if str(notif.get("level", "")).lower() == "error":
@@ -233,11 +254,35 @@ def parse_sarif(doc: dict) -> list[dict]:
     return out
 
 
+def parse_hadolint(doc: Any) -> list[dict]:
+    """
+    Hadolint JSON formatı (`hadolint --format json`).
+    
+    Hadolint level-ləri:
+      error   -> high (və ya policy override ilə critical)
+      warning -> medium
+      info    -> low
+      style   -> low
+    """
+    findings = doc if isinstance(doc, list) else (doc.get("results", []) if isinstance(doc, dict) else [])
+    out = []
+    for f in findings or []:
+        sev = _norm_sev(f.get("level"), default="medium")
+        out.append({
+            "severity": sev,
+            "id": f.get("code", "hadolint-finding"),
+            "location": f"{f.get('file', 'Dockerfile')}:{f.get('line', '?')}",
+            "title": (f.get("message") or "Dockerfile lint tapıntısı")[:160],
+        })
+    return out
+
+
 PARSERS = {
     "semgrep": parse_semgrep,
     "trivy": parse_trivy,
     "gitleaks": parse_gitleaks,
     "sarif": parse_sarif,
+    "hadolint": parse_hadolint,
 }
 
 

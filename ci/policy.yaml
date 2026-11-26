@@ -75,3 +75,27 @@ scanners:
     medium:   { action: block }
     low:      { action: warn }
     unknown:  { action: warn }
+
+  # Dockerfile linter (Hadolint — Phase 3, Gate 6A)
+  hadolint:
+    critical: { action: block }
+    high:     { action: block }
+    medium:   { action: warn, max_allowed: 10 }
+    low:      { action: warn }
+
+  # Image CVE scan (Trivy image — Phase 3, Gate 6B)
+  trivy-image:
+    critical: { action: block }
+    high:     { action: block }
+    medium:   { action: warn, max_allowed: 20 }
+    low:      { action: warn }
+
+  # Image / Layer Secret Scan (Trivy secret — Secret Lifecycle Gate 3)
+  # Sıfır tolerantlıq: layer daxilinə düşən istənilən credential kompromis sayılır.
+  trivy-image-secret:
+    critical: { action: block }
+    high:     { action: block }
+    medium:   { action: block }
+    low:      { action: block }
+    unknown:  { action: block }
+

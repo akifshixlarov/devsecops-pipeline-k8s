@@ -5,15 +5,19 @@ set -Eeuo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
+export PATH="${HOME}/.local/bin:/home/akif/.local/bin:${PATH}"
+
 GATE="${1:-sast}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
+
+SEMGREP_BIN="$(command -v semgrep || echo /home/akif/.local/bin/semgrep)"
 
 case "${GATE}" in
   sast)
     mkdir -p "${TMP}/src"
     cp tests/red/sast-vulnerable.js.txt "${TMP}/src/vulnerable.js"
-    semgrep scan --config=security/semgrep/rules --metrics=off \
+    "${SEMGREP_BIN}" scan --config=security/semgrep/rules --metrics=off \
       --json --output="${TMP}/report.json" "${TMP}" >/dev/null 2>&1 || true
     set +e
     python3 ci/severity_gate.py --report "${TMP}/report.json" \

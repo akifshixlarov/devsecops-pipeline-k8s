@@ -3,6 +3,7 @@
 # Registry olmadan yoxlanila bilen hisseler: trust policy dexilliyi,
 # digest-only tetbiqi, cosign flag uygunlugu.
 set -Eeuo pipefail
+export PATH="${HOME}/.local/bin:/home/akif/.local/bin:${PATH}"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "${REPO_ROOT}"
 

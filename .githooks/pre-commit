@@ -138,14 +138,20 @@ if [ ! -f "${REPORT}" ]; then
 fi
 
 # ── 6. Qərar ────────────────────────────────────────────────────────────────
+REPORT_WIN="${REPORT}"
+if command -v cygpath >/dev/null 2>&1; then
+  REPORT_WIN="$(cygpath -w "${REPORT}")"
+fi
+
 COUNT="$(python3 -c "
 import json,sys
 try:
-    d=json.load(open('${REPORT}'))
+    with open(sys.argv[1], 'r', encoding='utf-8') as f:
+        d=json.load(f)
     print(len(d) if isinstance(d,list) else len(d.get('findings',[])))
 except Exception:
     print(-1)
-" 2>/dev/null || echo -1)"
+" "${REPORT_WIN}" 2>/dev/null || echo -1)"
 
 if [ "${COUNT}" = "-1" ]; then
   say "${RED}${BLD}✗ COMMIT BLOKLANDI — report oxunmadı (fail-closed).${RST}"

@@ -58,9 +58,9 @@ COPY --chown=nonroot:nonroot src ./src
 COPY --chown=nonroot:nonroot healthcheck.js ./
 
 # Distroless image-in "nonroot" tag-i default istifadəçini artıq nonroot
-# təyin edir; bu sətir niyyəti açıq şəkildə sənədləşdirir və gələcəkdə
-# kimsə base image-i dəyişsə belə (root variant), buildi qırmır.
-USER nonroot
+# təyin edir; bu sətir niyyəti açıq şəkildə sənədləşdirir və rəqəmsal UID
+# ilə təyin olunur (Hadolint DL3066 və Kubernetes PSS uyğunluğu üçün).
+USER 65532:65532
 
 EXPOSE 3000
 

@@ -22,10 +22,17 @@ Secret hygiene:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
 from pathlib import Path
+
+# Ensure UTF-8 output encoding across platforms (Windows / Linux)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 try:
     import requests
@@ -40,13 +47,15 @@ GH_STEP_SUMMARY = os.environ.get("GITHUB_STEP_SUMMARY")
 # Bu adlar DefectDojo-nun rəsmi parser siyahısındakı sətirlərlə HƏRFI eyni
 # olmalıdır, əks halda API 400 qaytarır.
 SCAN_TYPES = {
-    "semgrep":      "Semgrep JSON Report",
-    "trivy-sca":    "Trivy Scan",
-    "trivy-config": "Trivy Scan",
-    "trivy-image":  "Trivy Scan",
-    "gitleaks":     "Gitleaks Scan",
-    "zizmor":       "SARIF",
-    "zap":          "ZAP Scan",           # Phase 7
+    "semgrep":            "Semgrep JSON Report",
+    "trivy-sca":          "Trivy Scan",
+    "trivy-config":       "Trivy Scan",
+    "trivy-image":        "Trivy Scan",
+    "trivy-image-secret": "Trivy Scan",
+    "gitleaks":           "Gitleaks Scan",
+    "hadolint":           "Hadolint Dockerfile check",
+    "zizmor":             "SARIF",
+    "zap":                "ZAP Scan",           # Phase 7
 }
 
 
@@ -63,6 +72,64 @@ def safe_error(resp: requests.Response) -> str:
     return f"HTTP {resp.status_code}: {body}"
 
 
+def validate_report(scanner: str, report: Path) -> tuple[bool, str]:
+    """
+    Upload-dan ƏVVƏL report-un etibarlı olduğunu yoxlayır.
+    Natamam/boş/zədəli report-lar `close_old_findings=true` ilə köhnə finding-ləri
+    səhvən "Mitigated" etməməlidir.
+    """
+    if not report.exists():
+        return False, f"report faylı tapılmadı: `{report}`"
+    raw = report.read_text(encoding="utf-8", errors="replace").strip()
+    if not raw:
+        return False, f"report faylı tamamilə boşdur (0 byte): `{report}`"
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        return False, f"report etibarlı JSON deyil ({exc})"
+
+    if scanner == "semgrep":
+        if not isinstance(doc, dict) or not isinstance(doc.get("results"), list):
+            return False, "Semgrep report-unda 'results' siyahısı yoxdur"
+        if doc.get("errors"):
+            return False, f"Semgrep report-u {len(doc['errors'])} icra xətası ehtiva edir"
+    elif scanner.startswith("trivy"):
+        if not isinstance(doc, dict):
+            return False, "Trivy report-u JSON obyekti deyil"
+        if "Results" in doc and not isinstance(doc["Results"], list):
+            return False, "Trivy report-unda 'Results' siyahı formatında deyil"
+        if "Results" not in doc and "SchemaVersion" not in doc:
+            return False, "Trivy report-unda nə 'Results', nə də 'SchemaVersion' var"
+    elif scanner == "gitleaks":
+        if not (isinstance(doc, list) or (isinstance(doc, dict) and isinstance(doc.get("findings"), list))):
+            return False, "Gitleaks report-u gözlənilən JSON array formatında deyil"
+    elif scanner == "hadolint":
+        if not (isinstance(doc, list) or (isinstance(doc, dict) and isinstance(doc.get("results"), list))):
+            return False, "Hadolint report-u gözlənilən JSON formatında deyil"
+    elif scanner == "zizmor":
+        if not isinstance(doc, dict) or not isinstance(doc.get("runs"), list):
+            return False, "SARIF report-unda 'runs' siyahısı yoxdur"
+    return True, "valid"
+
+
+def verify_test_import(dd_url: str, api_key: str, test_id: object, timeout: int) -> str:
+    """Upload sonrası DefectDojo API-dən Test və aktiv finding sayını təsdiqləyir."""
+    if not test_id or test_id == "?":
+        return "Test ID qaytarılmadı"
+    try:
+        resp = requests.get(
+            f"{dd_url.rstrip('/')}/api/v2/findings/?test={test_id}&active=true&limit=1",
+            headers={"Authorization": f"Token {api_key}"},
+            timeout=timeout,
+        )
+        if resp.status_code == 200:
+            active_count = resp.json().get("count", "?")
+            return f"DefectDojo Test ID: {test_id} (aktiv finding sayı: {active_count})"
+    except requests.RequestException:
+        pass
+    return f"DefectDojo Test ID: {test_id}"
+
+
 def upload(dd_url: str, api_key: str, engagement_id: str, scanner: str,
            report: Path, test_title: str, commit: str, branch: str,
            retries: int, timeout: int) -> tuple[bool, str]:
@@ -72,9 +139,42 @@ def upload(dd_url: str, api_key: str, engagement_id: str, scanner: str,
 
     endpoint = dd_url.rstrip("/") + "/api/v2/reimport-scan/"
 
+    product_name = os.environ.get("DD_PRODUCT_NAME")
+    engagement_name = os.environ.get("DD_ENGAGEMENT_NAME")
+
+    # DefectDojo reimport-scan API tələbi: product_name və engagement_name lazımdır.
+    # Əgər env-də verilməyibsə, engagement_id əsasında API-dən oxuyuruq.
+    if not (product_name and engagement_name) and engagement_id:
+        try:
+            eng_resp = requests.get(
+                f"{dd_url.rstrip('/')}/api/v2/engagements/{engagement_id}/",
+                headers={"Authorization": f"Token {api_key}"},
+                timeout=timeout,
+            )
+            if eng_resp.status_code == 200:
+                eng_data = eng_resp.json()
+                engagement_name = engagement_name or eng_data.get("name")
+                prod_id = eng_data.get("product")
+                if prod_id:
+                    prod_resp = requests.get(
+                        f"{dd_url.rstrip('/')}/api/v2/products/{prod_id}/",
+                        headers={"Authorization": f"Token {api_key}"},
+                        timeout=timeout,
+                    )
+                    if prod_resp.status_code == 200:
+                        product_name = product_name or prod_resp.json().get("name")
+        except Exception:
+            pass
+
+    product_name = product_name or "devsecops-pipeline-k8s"
+    engagement_name = engagement_name or "CI/CD Security Gates"
+
     data = {
         "scan_type": scan_type,
         "engagement": engagement_id,
+        "product_name": product_name,
+        "engagement_name": engagement_name,
+        "auto_create_context": "true",
         "test_title": test_title,
         # active+verified: finding-lər dərhal aktiv sayılsın (triage gözləmədən),
         # çünki gate qərarı onsuz da report əsasında verilir.
@@ -102,10 +202,11 @@ def upload(dd_url: str, api_key: str, engagement_id: str, scanner: str,
                 )
             if resp.status_code in (200, 201):
                 try:
-                    test_id = resp.json().get("test", "?")
+                    body = resp.json()
+                    test_id = body.get("test", "?")
                 except ValueError:
                     test_id = "?"
-                return True, f"DefectDojo Test ID: {test_id}"
+                return True, verify_test_import(dd_url, api_key, test_id, timeout)
 
             last_error = safe_error(resp)
             # 4xx (401/403/400) retry etmək mənasızdır — konfiqurasiya xətasıdır.
@@ -162,8 +263,9 @@ def main() -> int:
             return 1
         return 0
 
-    if not args.report.exists():
-        log(f"\n> ❌ **DefectDojo upload FAIL** — report tapılmadı: `{args.report}`\n")
+    ok_report, reason = validate_report(args.scanner, args.report)
+    if not ok_report:
+        log(f"\n> ❌ **DefectDojo upload BLOKLANDI (report etibarsız)** — {reason}\n")
         return 1 if required else 0
 
     repo = os.environ.get("GITHUB_REPOSITORY", "local")
